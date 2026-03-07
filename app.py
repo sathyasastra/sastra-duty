@@ -240,6 +240,7 @@ def get_exam_period(slot_dates):
     return sd[0], sd[-1]
 
 
+def render_header(logo=True):
     if logo and os.path.exists(LOGO_FILE):
         _, c2, _ = st.columns([2, 1, 2])
         with c2:
