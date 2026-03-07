@@ -209,7 +209,37 @@ def build_msg(name, will, val, inv, qp, match_str="", dev_lines=None):
     lines.append("- SASTRA SoME Examination Committee")
     return "\n".join(lines)
 
-def render_header(logo=True):
+def detect_semester(slot_dates=None):
+    """Auto-detect ODD or EVEN semester from slot dates or current month.
+    Admin can override via Portal Settings → Semester Setting."""
+    # Admin override takes priority
+    override = st.session_state.get("semester_override", "Auto-detect")
+    if override and override != "Auto-detect":
+        return override
+
+    now = datetime.date.today()
+    # Use slot dates if available
+    if slot_dates:
+        months = {d.month for d in slot_dates}
+        if months & {5, 6}:
+            return "Even Semester (Apr/May End-Semester)"
+        if months & {11, 12, 1}:
+            return "Odd Semester (Nov/Dec End-Semester)"
+    # Fallback: current month
+    if now.month in (4, 5, 6):
+        return "Even Semester (Apr/May End-Semester)"
+    if now.month in (11, 12, 1):
+        return "Odd Semester (Nov/Dec End-Semester)"
+    return "End-Semester Examination"
+
+def get_exam_period(slot_dates):
+    """Return (start_date, end_date) string from slot dates."""
+    if not slot_dates:
+        return None, None
+    sd = sorted(slot_dates)
+    return sd[0], sd[-1]
+
+
     if logo and os.path.exists(LOGO_FILE):
         _, c2, _ = st.columns([2, 1, 2])
         with c2:
@@ -283,6 +313,8 @@ def load_slots(off_path, on_path):
 #               WILLINGNESS FILE FUNCTIONS                       #
 # ═══════════════════════════════════════════════════════════════ #
 def load_willingness():
+    # NOTE: Disk/GitHub file is intentionally NOT used.
+    # Workflow: Faculty submit via portal → Admin downloads CSV → Admin uploads in Tab 1 → Run Optimizer
     uploaded_bytes = st.session_state.get("uploaded_willingness_bytes", None)
     source = None
     if uploaded_bytes is not None:
@@ -292,9 +324,8 @@ def load_willingness():
         except Exception:
             source = None
     if source is None:
-        if not os.path.exists(WILLINGNESS_FILE):
-            return pd.DataFrame(columns=["Faculty", "Date", "Session", "FacultyClean"])
-        source = WILLINGNESS_FILE
+        # No uploaded file — return empty (pending_submissions handled separately in get_all_willingness)
+        return pd.DataFrame(columns=["Faculty", "Date", "Session", "FacultyClean"])
 
     try:
         xl = pd.ExcelFile(source)
@@ -1089,13 +1120,14 @@ def run_optimizer(log_box):
         if needed <= 0:
             continue
 
-        for relax in range(4):
+        for relax in range(6):
             if needed <= 0:
                 break
             cands = []
             for fn in ALL_FAC:
                 desig_ = fac_d[fn]
-                if sl["type"] not in DESIG_RULES[desig_][2]:
+                # Relax 5: ignore type constraint (last resort — any faculty fills any slot)
+                if relax < 5 and sl["type"] not in DESIG_RULES[desig_][2]:
                     continue
                 if relax < 3 and sl["date"] in fac_val_dates.get(fn, set()):
                     continue
@@ -1108,7 +1140,8 @@ def run_optimizer(log_box):
                     if sl["type"] == "Offline" and acp_tc[fn]["Offline"] >= lim_off: continue
                 if relax < 1 and sl["date"] in cur_dates[fn]:
                     continue
-                if cur_alloc[fn] >= DESIG_RULES[desig_][1]:
+                # Relax 4: ignore max duty limit (force-fill critical unmet slots)
+                if relax < 4 and cur_alloc[fn] >= DESIG_RULES[desig_][1]:
                     continue
                 cands.append((fn, fexp[fn].get(key, 0)))
 
@@ -1174,7 +1207,8 @@ def run_optimizer(log_box):
             "Val_Adj":          int((ab == "Willingness-ValAdj").sum()),
             "Auto_Assigned":    int(ab.isin(["Auto-Assigned","OR-Assigned",
                                              "Gap-Fill","Gap-Fill-R2",
-                                             "Gap-Fill-R3","Gap-Fill-R4"]).sum()),
+                                             "Gap-Fill-R3","Gap-Fill-R4",
+                                             "Gap-Fill-R5"]).sum()),
             "Online":           int((rf["Type"] == "Online").sum()),
             "Offline":          int((rf["Type"] == "Offline").sum()),
             "Gap":              max(dr[0] - tot, 0),
@@ -1412,14 +1446,22 @@ if panel_mode == "Admin View":
         with t1:
             st.markdown("### Willingness Records")
 
-            st.markdown("#### 📤 Upload Willingness File")
-            up_src = "uploaded" if st.session_state.get("uploaded_willingness_bytes") else "disk"
+            st.info(
+                "📋 **Workflow:** Faculty submit willingness via this portal → "
+                "Admin downloads the collected data as Excel below → "
+                "Admin uploads it here to use for optimization. "
+                "**The system does NOT read Willingness.xlsx from GitHub/disk automatically.**"
+            )
+
+            st.markdown("#### 📤 Upload Collected Willingness File")
+            up_src = "uploaded" if st.session_state.get("uploaded_willingness_bytes") else "none"
             if up_src == "uploaded":
-                st.success("✅ Willingness file uploaded by admin — ready for optimizer.")
-            elif os.path.exists(WILLINGNESS_FILE):
-                st.info("ℹ️ Using Willingness.xlsx from folder. Upload a file below to override.")
+                st.success("✅ Willingness file uploaded by admin — optimizer will use this file.")
             else:
-                st.warning("⚠ No willingness file found. Please upload below.")
+                st.warning(
+                    "⚠ No willingness file uploaded yet. "
+                    "Download the collected willingness below and upload it here before running the optimizer."
+                )
 
             uploaded_will = st.file_uploader(
                 "Upload Willingness.xlsx",
@@ -1456,6 +1498,16 @@ if panel_mode == "Admin View":
                     "⬇ Download as CSV",
                     data=vdf[["Faculty", "Date", "Session"]].to_csv(index=False).encode("utf-8"),
                     file_name="Willingness.csv", mime="text/csv")
+                import io as _io
+                _buf = _io.BytesIO()
+                vdf[["Faculty", "Date", "Session"]].to_excel(_buf, index=False, engine="openpyxl")
+                st.download_button(
+                    "⬇ Download as Excel (.xlsx)",
+                    data=_buf.getvalue(),
+                    file_name="Willingness.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+                st.caption("⬆ After downloading, go to **Tab 2 → Run Optimizer** and upload this file there before running.")
 
             st.markdown("---")
             st.markdown("#### ⚠ Clear In-Session Submissions")
@@ -1474,11 +1526,9 @@ if panel_mode == "Admin View":
             st.markdown("### Run Allocation Optimizer")
             def fstat(f): return "✅ Found" if os.path.exists(f) else "❌ Missing"
             if st.session_state.get("uploaded_willingness_bytes"):
-                wstat = "✅ Uploaded by admin"
-            elif os.path.exists(WILLINGNESS_FILE):
-                wstat = "✅ Found (folder)"
+                wstat = "✅ Uploaded by admin (ready for optimizer)"
             else:
-                wstat = "⚠ Not found (all auto-assigned)"
+                wstat = "⚠ Not uploaded yet — go to Tab 1 to download & re-upload willingness"
             st.markdown(f"""
 | File | Purpose | Status |
 |---|---|---|
@@ -1562,6 +1612,22 @@ if panel_mode == "Admin View":
                                 .drop(columns=["_date","FacultyClean"], errors="ignore")\
                                 .reset_index(drop=True)
                             st.dataframe(bad_rows, use_container_width=True, hide_index=True)
+                        # Per-faculty breakdown
+                        with st.expander("👥 Which faculty submitted dates outside the exam period?"):
+                            _bad_fac = wdf_diag[wdf_diag["_date"].isin(only_will_diag)].copy()
+                            _bad_fac_grp = (
+                                _bad_fac.groupby("Faculty")
+                                .agg(OutOfRange_Dates=("Date", "count"))
+                                .reset_index()
+                                .sort_values("OutOfRange_Dates", ascending=False)
+                            )
+                            st.dataframe(_bad_fac_grp, use_container_width=True, hide_index=True)
+                            st.warning(
+                                "⬆ These faculty submitted willingness on dates that are NOT exam days. "
+                                "Please ask them to log in again and resubmit using the portal calendar. "
+                                "The portal's date picker only shows valid exam dates, "
+                                "so resubmitting via the portal will fix this automatically."
+                            )
                 else:
                     st.info("Upload willingness data and ensure slot files exist to run diagnostic.")
 
@@ -1642,7 +1708,7 @@ if panel_mode == "Admin View":
                 if tot2 > 0 and "Allocated_By" in av.columns:
                     ab3    = av["Allocated_By"]
                     will_m = int(ab3.isin(WILL_TAGS).sum())
-                    aut    = int(ab3.isin(["Auto-Assigned", "OR-Assigned", "Gap-Fill"]).sum())
+                    aut    = int(ab3.isin(["Auto-Assigned", "OR-Assigned", "Gap-Fill", "Gap-Fill-R2", "Gap-Fill-R3", "Gap-Fill-R4", "Gap-Fill-R5"]).sum())
                     c1, c2, c3, c4 = st.columns(4)
                     c1.metric("Total Assignments",  int(tot2))
                     c2.metric("Willingness Matched", will_m)
@@ -1656,9 +1722,22 @@ if panel_mode == "Admin View":
                         st.markdown(f"#### {label}")
                         if sh_name == "Slot_Verification" and "Status" in rep[sh_name].columns:
                             um = rep[sh_name][~rep[sh_name]["Status"].str.startswith("✓")]
-                            st.metric("Slots Fulfilled",
-                                      f"{len(rep[sh_name]) - len(um)}/{len(rep[sh_name])}",
-                                      delta="All Met ✓" if len(um) == 0 else f"{len(um)} unmet ⚠")
+                            total_slots = len(rep[sh_name])
+                            met_slots   = total_slots - len(um)
+                            if len(um) == 0:
+                                st.metric("Slots Fulfilled", f"{met_slots}/{total_slots}",
+                                          delta="✅ All Slots Met")
+                            else:
+                                st.metric("Slots Fulfilled", f"{met_slots}/{total_slots}",
+                                          delta=f"⚠ {len(um)} unmet — see rows below",
+                                          delta_color="inverse")
+                                st.error(
+                                    f"⚠️ **{len(um)} slot(s) could not be fully filled.** "
+                                    "This usually means there are not enough eligible faculty for that "
+                                    "specific slot type. "
+                                    "**Fix:** Increase faculty count in Faculty_Master.xlsx, "
+                                    "or reduce the required count in Offline_Duty.xlsx / Online_Duty.xlsx."
+                                )
                         st.dataframe(rep[sh_name], use_container_width=True, hide_index=True)
 
                 st.markdown("---")
@@ -1744,6 +1823,35 @@ if panel_mode == "Admin View":
                 "Review in View Results (Tab 3) → Enable when satisfied.")
 
             st.markdown("---")
+            st.markdown("#### 🗓️ Semester Setting")
+            st.markdown(
+                "Set which semester is displayed in the portal banner and allotment views. "
+                "**Auto-detect** uses the exam slot dates (recommended). "
+                "Use manual override only if the auto-detection is incorrect.")
+            _sem_options = [
+                "Auto-detect",
+                "Even Semester (Apr/May End-Semester)",
+                "Odd Semester (Nov/Dec End-Semester)",
+            ]
+            _cur_sem = st.session_state.get("semester_override", "Auto-detect")
+            _new_sem = st.selectbox(
+                "Semester Display Mode",
+                _sem_options,
+                index=_sem_options.index(_cur_sem) if _cur_sem in _sem_options else 0,
+                key="sem_select"
+            )
+            if _new_sem != _cur_sem:
+                st.session_state["semester_override"] = _new_sem
+                st.success(f"Semester set to: **{_new_sem}**")
+                st.rerun()
+
+            _preview_slots = parse_duty_file(OFFLINE_FILE, "Offline") + parse_duty_file(ONLINE_FILE, "Online")
+            _preview_dates = {s["date"] for s in _preview_slots}
+            st.caption(
+                f"🔍 Currently showing: **{detect_semester(_preview_dates)}**  "
+                f"(Auto-detect reads exam slot months)")
+
+            st.markdown("---")
             st.markdown("#### 🔐 Admin Session")
             if st.button("🔒 Lock Admin View", use_container_width=True):
                 st.session_state.admin_authenticated = False
@@ -1764,6 +1872,22 @@ user_mode = st.radio("User View", ["Willingness", "Allotment"],
 # ─── ALLOTMENT VIEW ──────────────────────────────────────────── #
 if user_mode == "Allotment":
     st.markdown("### My Allotment Details")
+
+    # Exam period + semester banner
+    _aslots = parse_duty_file(OFFLINE_FILE, "Offline") + parse_duty_file(ONLINE_FILE, "Online")
+    _aslot_dates = {s["date"] for s in _aslots}
+    _asem = detect_semester(_aslot_dates)
+    _as, _ae = get_exam_period(_aslot_dates)
+    if _as and _ae:
+        st.markdown(
+            f"<div style='background:#e0f2fe;border:1.5px solid #38bdf8;border-radius:10px;"
+            f"padding:10px 16px;margin-bottom:12px;font-size:.93rem;color:#0c4a6e'>"
+            f"🎓 <b>{_asem}</b>&nbsp;&nbsp;|&nbsp;&nbsp; 📅 Exam Period: "
+            f"<b>{_as.strftime('%d-%m-%Y')} ({_as.strftime('%A')})</b>"
+            f" → <b>{_ae.strftime('%d-%m-%Y')} ({_ae.strftime('%A')})</b>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
 
     if not gate_is_open():
         st.markdown(
@@ -1873,6 +1997,40 @@ if user_mode == "Allotment":
 
 # ─── WILLINGNESS SUBMISSION ───────────────────────────────────── #
 fnames2   = fac_df["Name"].dropna().drop_duplicates().tolist()
+
+# ── Exam period + semester banner ──────────────────────────────
+_all_slots_user = parse_duty_file(OFFLINE_FILE, "Offline") + parse_duty_file(ONLINE_FILE, "Online")
+_slot_dates_user = {s["date"] for s in _all_slots_user}
+_sem_label = detect_semester(_slot_dates_user)
+_exam_start, _exam_end = get_exam_period(_slot_dates_user)
+
+_period_str = ""
+if _exam_start and _exam_end:
+    _period_str = (
+        f"&nbsp;&nbsp;|&nbsp;&nbsp; 📅 Exam Period: "
+        f"<b>{_exam_start.strftime('%d-%m-%Y')} ({_exam_start.strftime('%A')})</b>"
+        f" → <b>{_exam_end.strftime('%d-%m-%Y')} ({_exam_end.strftime('%A')})</b>"
+    )
+
+st.markdown(
+    f"<div style='background:#e0f2fe;border:1.5px solid #38bdf8;border-radius:10px;"
+    f"padding:10px 16px;margin-bottom:4px;font-size:.93rem;color:#0c4a6e'>"
+    f"🎓 <b>{_sem_label}</b>{_period_str}"
+    f"</div>",
+    unsafe_allow_html=True
+)
+
+if _exam_start and _exam_end:
+    st.markdown(
+        f"<div style='background:#fef9c3;border:1.5px solid #fde047;border-radius:10px;"
+        f"padding:10px 16px;margin-bottom:12px;font-size:.9rem;color:#713f12'>"
+        f"⚠️ <b>Important:</b> Please select willingness dates <b>only within the exam period</b> "
+        f"(<b>{_exam_start.strftime('%d %b %Y')}</b> to <b>{_exam_end.strftime('%d %b %Y')}</b>). "
+        f"Dates outside this range cannot be matched and will reduce your allocation priority."
+        f"</div>",
+        unsafe_allow_html=True
+    )
+
 sel_name  = st.selectbox("Select Your Name", fnames2)
 sel_clean = clean(sel_name)
 fmatch    = fac_df[fac_df["Clean"] == sel_clean]
