@@ -1460,20 +1460,12 @@ if panel_mode == "Admin View":
 
         # ── Tab 1: Willingness Records ────────────────────────────
         with t1:
-            st.markdown("### Willingness Records")
+            st.markdown("### 📋 Willingness Records")
+            st.caption("All willingness submitted by faculty via this portal is shown below.")
 
-            st.info(
-                "📋 **Workflow:** Faculty submit willingness via this portal → "
-                "Admin downloads the collected data as Excel below → "
-                "Admin uploads it in the section below to use for optimization. "
-                "**The system does NOT read Willingness.xlsx from GitHub/disk automatically.**"
-            )
-
-            # ── Section 1: View & Download ────────────────────────
-            st.markdown("#### 📋 Step 1 — View & Download Collected Willingness")
             w_all = get_all_willingness()
             if w_all.empty:
-                st.info("No willingness data collected yet. Faculty must submit via the portal first.")
+                st.info("No willingness data collected yet. Faculty must submit via the User View → Willingness tab.")
             else:
                 vdf = w_all.drop(columns=["FacultyClean"], errors="ignore").reset_index(drop=True)
                 if "Sl.No" not in vdf.columns:
@@ -1484,6 +1476,8 @@ if panel_mode == "Admin View":
                 c2.metric("Not Yet Submitted",  len(fac_df) - sub_cnt_val)
                 c3.metric("Total Rows",          len(vdf))
                 st.dataframe(vdf, use_container_width=True, hide_index=True)
+
+                st.markdown("#### ⬇ Download Collected Willingness")
                 dl1, dl2 = st.columns(2)
                 with dl1:
                     st.download_button(
@@ -1501,40 +1495,11 @@ if panel_mode == "Admin View":
                         file_name="Willingness.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True)
-                st.caption("⬆ Download the Excel file, then upload it in Step 2 below before running the optimizer.")
+                st.caption("After downloading, go to **🤖 Run Optimizer** tab → upload this file → run the optimizer.")
 
             st.markdown("---")
-            # ── Section 2: Upload ─────────────────────────────────
-            st.markdown("#### 📤 Step 2 — Upload Willingness File for Optimization")
-            up_src = "uploaded" if st.session_state.get("uploaded_willingness_bytes") else "none"
-            if up_src == "uploaded":
-                st.success("✅ Willingness file uploaded — optimizer will use this file.")
-            else:
-                st.warning(
-                    "⚠ No file uploaded yet. Download the collected willingness above "
-                    "and upload it here before running the optimizer."
-                )
-
-            uploaded_will = st.file_uploader(
-                "Upload Willingness.xlsx",
-                type=["xlsx", "xls"],
-                key="will_uploader",
-                help="Upload the faculty willingness Excel file."
-            )
-            if uploaded_will is not None:
-                st.session_state["uploaded_willingness_bytes"] = uploaded_will.read()
-                st.success(f"✅ '{uploaded_will.name}' uploaded successfully.")
-                st.rerun()
-
-            if st.session_state.get("uploaded_willingness_bytes"):
-                if st.button("🗑 Remove Uploaded File", type="secondary"):
-                    del st.session_state["uploaded_willingness_bytes"]
-                    st.rerun()
-
-            st.markdown("---")
-            # ── Section 3: Clear ──────────────────────────────────
-            st.markdown("#### ⚠ Step 3 — Clear In-Session Submissions")
-            st.caption("Use this only to reset all willingness submitted in the current session (e.g. for a fresh collection round).")
+            st.markdown("#### ⚠ Clear In-Session Submissions")
+            st.caption("Use this only to reset willingness submitted in the current session (e.g. for a fresh collection round).")
             st.checkbox("Confirm clearing all in-session submissions", key="confirm_delete")
             if st.button("Clear Session Submissions", type="primary"):
                 if st.session_state.confirm_delete:
@@ -1547,12 +1512,39 @@ if panel_mode == "Admin View":
 
         # ── Tab 2: Run Optimizer ──────────────────────────────────
         with t2:
-            st.markdown("### Run Allocation Optimizer")
+            st.markdown("### 🤖 Run Allocation Optimizer")
+
+            # ── Step 1: Upload willingness ────────────────────────
+            st.markdown("#### 📤 Step 1 — Upload Willingness File")
+            st.caption("Download the willingness from the **📋 Willingness Records** tab, then upload it here.")
+
+            if st.session_state.get("uploaded_willingness_bytes"):
+                st.success("✅ Willingness file uploaded and ready for optimizer.")
+                if st.button("🗑 Remove Uploaded File", type="secondary", key="rm_will"):
+                    del st.session_state["uploaded_willingness_bytes"]
+                    st.rerun()
+            else:
+                st.warning("⚠ No willingness file uploaded yet. Upload the downloaded Willingness.xlsx below.")
+
+            uploaded_will = st.file_uploader(
+                "Upload Willingness.xlsx / .csv",
+                type=["xlsx", "xls"],
+                key="will_uploader",
+                help="Upload the Willingness.xlsx downloaded from the Willingness Records tab."
+            )
+            if uploaded_will is not None:
+                st.session_state["uploaded_willingness_bytes"] = uploaded_will.read()
+                st.success(f"✅ '{uploaded_will.name}' uploaded successfully.")
+                st.rerun()
+
+            st.markdown("---")
+            # ── Step 2: File status ───────────────────────────────
+            st.markdown("#### 📁 Step 2 — File Status Check")
             def fstat(f): return "✅ Found" if os.path.exists(f) else "❌ Missing"
             if st.session_state.get("uploaded_willingness_bytes"):
-                wstat = "✅ Uploaded by admin (ready for optimizer)"
+                wstat = "✅ Uploaded — ready"
             else:
-                wstat = "⚠ Not uploaded yet — go to Tab 1 to download & re-upload willingness"
+                wstat = "⚠ Not uploaded — upload above first"
             st.markdown(f"""
 | File | Purpose | Status |
 |---|---|---|
