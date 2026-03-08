@@ -681,6 +681,14 @@ def render_calendar(duty_df, val_dates, title):
         st.info("No slot data available.")
         return
 
+    # Only render months that actually contain exam slots
+    slot_day_set = set(duty_df["Date"].dt.date)
+    if slot_day_set:
+        first_slot = min(slot_day_set)
+        last_slot  = max(slot_day_set)
+    else:
+        return
+
     months = sorted({(d.year, d.month) for d in duty_df["Date"]})
 
     sg = duty_df.groupby(["Date", "Session"], as_index=False)["Required"].sum()
@@ -696,7 +704,7 @@ def render_calendar(duty_df, val_dates, title):
         "<span style='background:#fce7f3;border:1px solid #f9a8d4;border-radius:4px;"
         "padding:2px 8px;margin-right:6px'>🩷 Valuation Locked</span>"
         "<span style='background:#fff;border:1px solid #cbd5e1;border-radius:4px;"
-        "padding:2px 8px'>🔢 Number = duties required</span>"
+        "padding:2px 8px'>🔢 Number = duties required on that day/session</span>"
         "</span>",
         unsafe_allow_html=True
     )
@@ -711,13 +719,18 @@ def render_calendar(duty_df, val_dates, title):
         grid = []
         week = [None] * fw
         for dt in days:
-            week.append(dt.date())
+            # Only show dates within the actual exam period (first_slot to last_slot)
+            dt_date = dt.date()
+            cell = dt_date if (dt_date >= first_slot and dt_date <= last_slot) else None
+            week.append(cell)
             if len(week) == 7:
                 grid.append(week)
                 week = []
         if week:
             week += [None] * (7 - len(week))
             grid.append(week)
+        # Remove entirely-empty weeks (all None) that fall outside exam period
+        grid = [w for w in grid if any(d is not None for d in w)]
 
         st.markdown(
             f"<div style='font-size:.95rem;font-weight:700;color:#1e3a5f;"
@@ -815,7 +828,7 @@ def render_calendar(duty_df, val_dates, title):
 """
         st.markdown(table_html, unsafe_allow_html=True)
 
-    st.caption("FN = Forenoon  |  AN = Afternoon  |  Numbers = duties required")
+    st.caption("FN = Forenoon  |  AN = Afternoon  |  Numbers = duties required on that day/session")
 
 
 # ═══════════════════════════════════════════════════════════════ #
@@ -1050,6 +1063,7 @@ def run_optimizer(log_box):
         if dt_ in fac_val_dates.get(n, set()):                   return False
         if dt_ in used_dates[n]:                                  return False
         if remaining(n) <= 0:                                     return False
+        # Saturday only allowed for TA and RA — strictly enforced
         if dt_.weekday() == 5 and desig_ not in SAT_DESIG:       return False
         if desig_ == "ACP":
             if tp_ == "Online"  and acp_type_count[n]["Online"]  >= acp_online_limit.get(n, 1):  return False
@@ -1132,7 +1146,8 @@ def run_optimizer(log_box):
                     continue
                 if relax < 3 and sl["date"] in fac_val_dates.get(fn, set()):
                     continue
-                if relax < 2 and sl["date"].weekday() == 5 and desig_ not in SAT_DESIG:
+                # Saturday strictly only for TA/RA — never relaxed regardless of level
+                if sl["date"].weekday() == 5 and desig_ not in SAT_DESIG:
                     continue
                 if desig_ == "ACP":
                     lim_on  = acp_online_limit.get(fn, 1)
@@ -1450,18 +1465,54 @@ if panel_mode == "Admin View":
             st.info(
                 "📋 **Workflow:** Faculty submit willingness via this portal → "
                 "Admin downloads the collected data as Excel below → "
-                "Admin uploads it here to use for optimization. "
+                "Admin uploads it in the section below to use for optimization. "
                 "**The system does NOT read Willingness.xlsx from GitHub/disk automatically.**"
             )
 
-            st.markdown("#### 📤 Upload Collected Willingness File")
+            # ── Section 1: View & Download ────────────────────────
+            st.markdown("#### 📋 Step 1 — View & Download Collected Willingness")
+            w_all = get_all_willingness()
+            if w_all.empty:
+                st.info("No willingness data collected yet. Faculty must submit via the portal first.")
+            else:
+                vdf = w_all.drop(columns=["FacultyClean"], errors="ignore").reset_index(drop=True)
+                if "Sl.No" not in vdf.columns:
+                    vdf.insert(0, "Sl.No", vdf.index + 1)
+                sub_cnt_val = vdf["Faculty"].nunique() if "Faculty" in vdf.columns else 0
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Faculty Submitted",  sub_cnt_val)
+                c2.metric("Not Yet Submitted",  len(fac_df) - sub_cnt_val)
+                c3.metric("Total Rows",          len(vdf))
+                st.dataframe(vdf, use_container_width=True, hide_index=True)
+                dl1, dl2 = st.columns(2)
+                with dl1:
+                    st.download_button(
+                        "⬇ Download as CSV",
+                        data=vdf[["Faculty", "Date", "Session"]].to_csv(index=False).encode("utf-8"),
+                        file_name="Willingness.csv", mime="text/csv",
+                        use_container_width=True)
+                with dl2:
+                    import io as _io
+                    _buf = _io.BytesIO()
+                    vdf[["Faculty", "Date", "Session"]].to_excel(_buf, index=False, engine="openpyxl")
+                    st.download_button(
+                        "⬇ Download as Excel (.xlsx)",
+                        data=_buf.getvalue(),
+                        file_name="Willingness.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True)
+                st.caption("⬆ Download the Excel file, then upload it in Step 2 below before running the optimizer.")
+
+            st.markdown("---")
+            # ── Section 2: Upload ─────────────────────────────────
+            st.markdown("#### 📤 Step 2 — Upload Willingness File for Optimization")
             up_src = "uploaded" if st.session_state.get("uploaded_willingness_bytes") else "none"
             if up_src == "uploaded":
-                st.success("✅ Willingness file uploaded by admin — optimizer will use this file.")
+                st.success("✅ Willingness file uploaded — optimizer will use this file.")
             else:
                 st.warning(
-                    "⚠ No willingness file uploaded yet. "
-                    "Download the collected willingness below and upload it here before running the optimizer."
+                    "⚠ No file uploaded yet. Download the collected willingness above "
+                    "and upload it here before running the optimizer."
                 )
 
             uploaded_will = st.file_uploader(
@@ -1476,42 +1527,14 @@ if panel_mode == "Admin View":
                 st.rerun()
 
             if st.session_state.get("uploaded_willingness_bytes"):
-                if st.button("🗑 Remove Uploaded File (revert to folder file)", type="secondary"):
+                if st.button("🗑 Remove Uploaded File", type="secondary"):
                     del st.session_state["uploaded_willingness_bytes"]
                     st.rerun()
 
             st.markdown("---")
-            st.markdown("#### 📋 Current Willingness Data")
-            w_all = get_all_willingness()
-            if w_all.empty:
-                st.info("No willingness data found.")
-            else:
-                vdf = w_all.drop(columns=["FacultyClean"], errors="ignore").reset_index(drop=True)
-                if "Sl.No" not in vdf.columns:
-                    vdf.insert(0, "Sl.No", vdf.index + 1)
-                sub_cnt_val = vdf["Faculty"].nunique() if "Faculty" in vdf.columns else 0
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Faculty Submitted",  sub_cnt_val)
-                c2.metric("Not Yet Submitted",  len(fac_df) - sub_cnt_val)
-                c3.metric("Total Rows",          len(vdf))
-                st.dataframe(vdf, use_container_width=True, hide_index=True)
-                st.download_button(
-                    "⬇ Download as CSV",
-                    data=vdf[["Faculty", "Date", "Session"]].to_csv(index=False).encode("utf-8"),
-                    file_name="Willingness.csv", mime="text/csv")
-                import io as _io
-                _buf = _io.BytesIO()
-                vdf[["Faculty", "Date", "Session"]].to_excel(_buf, index=False, engine="openpyxl")
-                st.download_button(
-                    "⬇ Download as Excel (.xlsx)",
-                    data=_buf.getvalue(),
-                    file_name="Willingness.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-                st.caption("⬆ After downloading, go to **Tab 2 → Run Optimizer** and upload this file there before running.")
-
-            st.markdown("---")
-            st.markdown("#### ⚠ Clear In-Session Submissions")
+            # ── Section 3: Clear ──────────────────────────────────
+            st.markdown("#### ⚠ Step 3 — Clear In-Session Submissions")
+            st.caption("Use this only to reset all willingness submitted in the current session (e.g. for a fresh collection round).")
             st.checkbox("Confirm clearing all in-session submissions", key="confirm_delete")
             if st.button("Clear Session Submissions", type="primary"):
                 if st.session_state.confirm_delete:
@@ -2021,16 +2044,7 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-if _exam_start and _exam_end:
-    st.markdown(
-        f"<div style='background:#fef9c3;border:1.5px solid #fde047;border-radius:10px;"
-        f"padding:10px 16px;margin-bottom:12px;font-size:.9rem;color:#713f12'>"
-        f"⚠️ <b>Important:</b> Please select willingness dates <b>only within the exam period</b> "
-        f"(<b>{_exam_start.strftime('%d %b %Y')}</b> to <b>{_exam_end.strftime('%d %b %Y')}</b>). "
-        f"Dates outside this range cannot be matched and will reduce your allocation priority."
-        f"</div>",
-        unsafe_allow_html=True
-    )
+
 
 sel_name  = st.selectbox("Select Your Name", fnames2)
 sel_clean = clean(sel_name)
