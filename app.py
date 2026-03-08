@@ -1527,24 +1527,35 @@ if panel_mode == "Admin View":
                 st.warning("⚠ No willingness file uploaded yet. Upload the downloaded Willingness.xlsx below.")
 
             uploaded_will = st.file_uploader(
-                "Upload Willingness.xlsx / .csv",
+                "Upload Willingness.xlsx",
                 type=["xlsx", "xls"],
                 key="will_uploader",
                 help="Upload the Willingness.xlsx downloaded from the Willingness Records tab."
             )
             if uploaded_will is not None:
-                st.session_state["uploaded_willingness_bytes"] = uploaded_will.read()
-                st.success(f"✅ '{uploaded_will.name}' uploaded successfully.")
-                st.rerun()
+                raw_bytes = uploaded_will.read()
+                st.session_state["uploaded_willingness_bytes"] = raw_bytes
+                import io as _io2
+                _prev = pd.read_excel(_io2.BytesIO(raw_bytes))
+                st.success(
+                    f"✅ '{uploaded_will.name}' uploaded — "
+                    f"{len(_prev)} rows, {_prev['Faculty'].nunique() if 'Faculty' in _prev.columns else '?'} faculty."
+                )
 
             st.markdown("---")
             # ── Step 2: File status ───────────────────────────────
             st.markdown("#### 📁 Step 2 — File Status Check")
             def fstat(f): return "✅ Found" if os.path.exists(f) else "❌ Missing"
-            if st.session_state.get("uploaded_willingness_bytes"):
-                wstat = "✅ Uploaded — ready"
+            _wb = st.session_state.get("uploaded_willingness_bytes")
+            if _wb:
+                import io as _io3
+                _wdf_check = pd.read_excel(_io3.BytesIO(_wb))
+                _wrows = len(_wdf_check)
+                _wfac  = _wdf_check["Faculty"].nunique() if "Faculty" in _wdf_check.columns else 0
+                wstat = f"✅ Uploaded — {_wrows} rows, {_wfac} faculty"
             else:
                 wstat = "⚠ Not uploaded — upload above first"
+                _wrows, _wfac = 0, 0
             st.markdown(f"""
 | File | Purpose | Status |
 |---|---|---|
@@ -1553,12 +1564,10 @@ if panel_mode == "Admin View":
 | `Online_Duty.xlsx`    | Online exam slots           | {fstat(ONLINE_FILE)} |
 | `Willingness.xlsx`    | Faculty willingness         | {wstat} |
 """)
-            wn = get_all_willingness()
-            sc2 = wn["Faculty"].nunique() if not wn.empty and "Faculty" in wn.columns else 0
             c1, c2, c3 = st.columns(3)
             c1.metric("Total Faculty",         len(fac_df))
-            c2.metric("Willingness Submitted", f"{sc2}/{len(fac_df)}")
-            c3.metric("Willingness Rows",      len(wn))
+            c2.metric("Willingness Submitted", f"{_wfac}/{len(fac_df)}")
+            c3.metric("Willingness Rows",      _wrows)
 
             if not os.path.exists(FACULTY_FILE) or not os.path.exists(OFFLINE_FILE):
                 st.error("Faculty_Master.xlsx and Offline_Duty.xlsx are required.")
