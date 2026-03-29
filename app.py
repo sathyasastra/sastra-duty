@@ -2,28 +2,29 @@
 SASTRA SoME End Semester Examination Duty Portal
 =================================================
 Files required in the same folder as app.py:
-  1. Faculty_Master.xlsx  — faculty list + designation + optional valuation date cols (V1..V5)
+  1. Faculty_Master.xlsx  — columns: Name | ID No. | Designation | V1..V5
+                            (+ optional valuation date cols V1..V5)
   2. Offline_Duty.xlsx    — offline exam slots  (col A: Date | col B: FN/AN | col C: count)
   3. Online_Duty.xlsx     — online exam slots   (col A: Date | col B: FN/AN | col C: count)
   4. sastra_logo.png      — university logo (optional)
-  5. Willingness.xlsx     — faculty willingness collected via this portal
+  5. faculty_passwords.json — auto-created on first run; keyed by Faculty ID No.
 
-Login credentials:
-  Faculty portal : SASTRA / SASTRA
-  Admin panel    : sathya
+Login:
+  Faculty portal : enter your Faculty ID (e.g. C870, RS602) + password
+  Default password on first login: "sastra" (forced change on first use)
+  Admin panel    : any faculty marked is_admin=true in faculty_passwords.json
 
-v3 improvements:
-  1. Slot allocation probability shown live during willingness submission
-  2. Admin enable/disable toggle for allotment view (gate file: allotment_gate.txt)
-  3. Deviation analysis in allotment page — ADMIN ONLY
-  4. Date overlap diagnostic tool in Admin Tab 2
-  5. ACP online limit raised to 2 to cover unfilled online slots
-  6. Detailed match-failure report in optimizer log
+v5 — ID-based login | bcrypt passwords | resubmission | accommodation stats
+     Core optimizer: scipy HiGHS MILP | Smart Greedy | OR-Tools CP-SAT
 """
 
 import os
+import io
+import json
+import secrets
 import datetime
 import warnings
+import logging
 import calendar as calmod
 import urllib.parse
 from collections import defaultdict
@@ -33,11 +34,13 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 
+logging.getLogger("streamlit").setLevel(logging.ERROR)
+
 try:
-    from ortools.sat.python import cp_model
-    ORTOOLS_OK = True
+    import bcrypt
+    BCRYPT_OK = True
 except ImportError:
-    ORTOOLS_OK = False
+    BCRYPT_OK = False
 
 try:
     from scipy.optimize import milp, LinearConstraint, Bounds
@@ -45,6 +48,20 @@ try:
     SCIPY_OK = True
 except ImportError:
     SCIPY_OK = False
+
+try:
+    import ctypes
+    ctypes.windll.kernel32.SetErrorMode(0x8007)
+except Exception:
+    pass
+
+try:
+    from ortools.sat.python import cp_model
+    _test = cp_model.CpModel()
+    del _test
+    ORTOOLS_OK = True
+except Exception:
+    ORTOOLS_OK = False
 
 warnings.filterwarnings("ignore")
 
@@ -56,9 +73,27 @@ WILLINGNESS_FILE  = "Willingness.xlsx"
 LOGO_FILE         = "sastra_logo.png"
 FINAL_ALLOC_FILE  = "Final_Allocation.xlsx"
 ALLOC_REPORT_FILE = "Allocation_Report.xlsx"
-GATE_FILE         = "allotment_gate.txt"   # "1" = open, "0" = locked
+GATE_FILE         = "allotment_gate.txt"
+PASSWORDS_FILE    = "faculty_passwords.json"
+
+DEFAULT_PASSWORD  = "sastra"   # every new faculty's first-time password
+ADMIN_IDS        = {"C2086"}  # Faculty IDs that are always admin
 
 # ─── Designation rules ───────────────────────────────────────── #
+# Map raw Excel designation strings → internal codes
+DESIG_MAP = {
+    "professor":          "P",
+    "acp":                "ACP",
+    "sap":                "SAP",
+    "ap 3":               "AP3",
+    "ap3":                "AP3",
+    "ap 2":               "AP2",
+    "ap2":                "AP2",
+    "teaching assistant": "TA",
+    "ta":                 "TA",
+    "research assistant": "RA",
+    "ra":                 "RA",
+}
 DESIG_RULES = {
     "P":   (1, 1, ["Online"]),
     "ACP": (2, 2, ["Online", "Offline"]),
@@ -80,15 +115,15 @@ DESIG_FULL = {
 DUTY_STRUCTURE = {"P": 3, "ACP": 5, "SAP": 7, "AP3": 7, "AP2": 7, "TA": 9, "RA": 9}
 
 # ── Willingness match scores ──────────────────────────────────── #
-W_EXACT      = 100_000   # exact date + session match
-W_ACP_ONLINE =  80_000   # ACP offline→online mapping
-W_FLIP       =  60_000   # same date, opposite session (FN↔AN)
-W_ADJ1       =  40_000   # ±1 business day adjacency
-W_VAL_ADJ    =   5_000   # adjacent to own valuation date
-W_NON_SUB    =     100   # no willingness submitted
-PENALTY      =      10   # submitted but slot outside window (discourage)
+W_EXACT      = 100_000
+W_ACP_ONLINE =  80_000
+W_FLIP       =  60_000
+W_ADJ1       =  40_000
+W_ADJ2       =  20_000
+W_VAL_ADJ    =   5_000
+W_NON_SUB    =     100
+PENALTY      =      10
 
-# ── Designation priority (higher = preferred for slot filling) ── #
 DESIG_PRIORITY = {
     "P":   6_000_000,
     "ACP": 5_000_000,
@@ -101,7 +136,9 @@ DESIG_PRIORITY = {
 
 WILL_TAGS = {
     "Willingness-Exact", "Willingness-ACPOnline",
-    "Willingness-SessionFlip", "Willingness-±1Day", "Willingness-ValAdj"
+    "Willingness-SessionFlip", "Willingness-±1Day",
+    "Willingness-±2Day", "Willingness-ValAdj",
+    "SAP-OnlineFallback"
 }
 
 # ─── Page config ─────────────────────────────────────────────── #
@@ -127,7 +164,7 @@ st.markdown("""
 
 
 # ═══════════════════════════════════════════════════════════════ #
-#              ALLOTMENT GATE  (Feature 2)                       #
+#                   ALLOTMENT GATE                               #
 # ═══════════════════════════════════════════════════════════════ #
 def gate_is_open() -> bool:
     try:
@@ -139,6 +176,127 @@ def gate_is_open() -> bool:
 def set_gate(open_: bool):
     with open(GATE_FILE, "w") as f:
         f.write("1" if open_ else "0")
+
+
+# ═══════════════════════════════════════════════════════════════ #
+#              PASSWORD HELPERS (bcrypt)                         #
+# ═══════════════════════════════════════════════════════════════ #
+def hash_password(plain: str) -> str:
+    if BCRYPT_OK:
+        return bcrypt.hashpw(plain.encode(), bcrypt.gensalt()).decode()
+    # Fallback: SHA-256 prefixed (insecure, encourages installing bcrypt)
+    import hashlib
+    return "sha256:" + hashlib.sha256(plain.encode()).hexdigest()
+
+def verify_password(plain: str, hashed: str) -> bool:
+    if not hashed:
+        return False
+    try:
+        if hashed.startswith("sha256:"):
+            import hashlib
+            return hashed == "sha256:" + hashlib.sha256(plain.encode()).hexdigest()
+        if BCRYPT_OK:
+            return bcrypt.checkpw(plain.encode(), hashed.encode())
+    except Exception:
+        pass
+    # Last resort: plain text comparison for corrupted/legacy entries
+    try:
+        return plain == hashed
+    except Exception:
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════ #
+#           PASSWORD FILE (faculty_passwords.json)               #
+# ═══════════════════════════════════════════════════════════════ #
+def _load_pw_store() -> dict:
+    """Load passwords dict from JSON; auto-creates the file if absent."""
+    if not os.path.exists(PASSWORDS_FILE):
+        return {}
+    try:
+        with open(PASSWORDS_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_pw_store(store: dict):
+    with open(PASSWORDS_FILE, "w") as f:
+        json.dump(store, f, indent=2)
+
+def pw_get(fid: str) -> dict | None:
+    return _load_pw_store().get(_norm_id(fid))
+
+def _norm_id(fid: str) -> str:
+    """Normalise a faculty ID: uppercase, strip all spaces (e.g. 'RS 1051' → 'RS1051')."""
+    return str(fid).strip().upper().replace(" ", "")
+
+def pw_ensure(fid: str):
+    """Create a default entry if the faculty has no password yet.
+    Auto-grants admin if the ID is in ADMIN_IDS."""
+    fid = _norm_id(fid)
+    store = _load_pw_store()
+    if fid not in store:
+        store[fid] = {
+            "password_hash": hash_password(DEFAULT_PASSWORD),
+            "must_change_pw": True,
+            "is_admin": fid in ADMIN_IDS,
+        }
+        _save_pw_store(store)
+    elif fid in ADMIN_IDS and not store[fid].get("is_admin", False):
+        # Ensure admin flag is always set for ADMIN_IDS members
+        store[fid]["is_admin"] = True
+        _save_pw_store(store)
+
+def pw_update(fid: str, new_hash: str, must_change: bool = False):
+    fid = _norm_id(fid)
+    store = _load_pw_store()
+    if fid not in store:
+        store[fid] = {}
+    store[fid]["password_hash"] = new_hash
+    store[fid]["must_change_pw"] = must_change
+    _save_pw_store(store)
+
+def pw_reset(fid: str):
+    """Reset to default password and force change on next login."""
+    fid = _norm_id(fid)
+    store = _load_pw_store()
+    store[fid] = {
+        "password_hash": hash_password(DEFAULT_PASSWORD),
+        "must_change_pw": True,
+        "is_admin": store.get(fid, {}).get("is_admin", False),
+    }
+    _save_pw_store(store)
+
+def pw_set_admin(fid: str, is_admin: bool):
+    fid = _norm_id(fid)
+    store = _load_pw_store()
+    if fid not in store:
+        pw_ensure(fid)
+        store = _load_pw_store()
+    store[fid]["is_admin"] = is_admin
+    _save_pw_store(store)
+
+def pw_ensure_all(id_list: list):
+    """Ensure every faculty ID in the list has a password entry.
+    id_list: list of faculty ID strings (e.g. ['C870', 'RS1051', ...])
+    Auto-grants admin to any ID in ADMIN_IDS.
+    """
+    store = _load_pw_store()
+    changed = False
+    for fid_raw in id_list:
+        fid = _norm_id(fid_raw)
+        if fid not in store:
+            store[fid] = {
+                "password_hash": hash_password(DEFAULT_PASSWORD),
+                "must_change_pw": True,
+                "is_admin": fid in ADMIN_IDS,
+            }
+            changed = True
+        elif fid in ADMIN_IDS and not store[fid].get("is_admin", False):
+            store[fid]["is_admin"] = True
+            changed = True
+    if changed:
+        _save_pw_store(store)
 
 
 # ═══════════════════════════════════════════════════════════════ #
@@ -155,9 +313,30 @@ def normalize_session(v):
         return "AN"
     return t
 
+def parse_date_safe(val):
+    """Robust multi-format date parser."""
+    if val is None:
+        return pd.NaT
+    if isinstance(val, pd.Timestamp):
+        return val
+    if isinstance(val, (datetime.datetime, datetime.date)):
+        return pd.Timestamp(val)
+    s = str(val).strip()
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%d-%m-%y"):
+        try:
+            return pd.to_datetime(s, format=fmt)
+        except Exception:
+            pass
+    return pd.to_datetime(s, dayfirst=True, errors="coerce")
+
 def fmt_day(val):
     dt = pd.to_datetime(val, dayfirst=True, errors="coerce")
     return f"{dt.strftime('%d-%m-%Y')} ({dt.strftime('%A')})" if pd.notna(dt) else str(val)
+
+def demand_category(req: int) -> str:
+    if req < 3:  return "Low (<3)"
+    if req <= 7: return "Medium (3-7)"
+    return "High (>7)"
 
 def valuation_dates_for(row):
     return sorted({
@@ -210,22 +389,16 @@ def build_msg(name, will, val, inv, qp, match_str="", dev_lines=None):
     return "\n".join(lines)
 
 def detect_semester(slot_dates=None):
-    """Auto-detect ODD or EVEN semester from slot dates or current month.
-    Admin can override via Portal Settings → Semester Setting."""
-    # Admin override takes priority
     override = st.session_state.get("semester_override", "Auto-detect")
     if override and override != "Auto-detect":
         return override
-
     now = datetime.date.today()
-    # Use slot dates if available
     if slot_dates:
         months = {d.month for d in slot_dates}
         if months & {5, 6}:
             return "Even Semester (Apr/May End-Semester)"
         if months & {11, 12, 1}:
             return "Odd Semester (Nov/Dec End-Semester)"
-    # Fallback: current month
     if now.month in (4, 5, 6):
         return "Even Semester (Apr/May End-Semester)"
     if now.month in (11, 12, 1):
@@ -233,12 +406,10 @@ def detect_semester(slot_dates=None):
     return "End-Semester Examination"
 
 def get_exam_period(slot_dates):
-    """Return (start_date, end_date) string from slot dates."""
     if not slot_dates:
         return None, None
     sd = sorted(slot_dates)
     return sd[0], sd[-1]
-
 
 def render_header(logo=True):
     if logo and os.path.exists(LOGO_FILE):
@@ -248,18 +419,16 @@ def render_header(logo=True):
     st.markdown(
         "<h2 style='text-align:center;margin-bottom:.25rem'>"
         "SASTRA SoME End Semester Examination Duty Portal</h2>",
-        unsafe_allow_html=True
-    )
+        unsafe_allow_html=True)
     st.markdown(
         "<h4 style='text-align:center;margin-top:0'>"
         "School of Mechanical Engineering</h4>",
-        unsafe_allow_html=True
-    )
+        unsafe_allow_html=True)
     st.markdown("---")
 
 
 # ═══════════════════════════════════════════════════════════════ #
-#               PARSE DUTY FILE (shared helper)                  #
+#               PARSE DUTY FILE                                  #
 # ═══════════════════════════════════════════════════════════════ #
 def parse_duty_file(filepath, duty_type):
     if not os.path.exists(filepath):
@@ -314,22 +483,11 @@ def load_slots(off_path, on_path):
 #               WILLINGNESS FILE FUNCTIONS                       #
 # ═══════════════════════════════════════════════════════════════ #
 def load_willingness():
-    # NOTE: Disk/GitHub file is intentionally NOT used.
-    # Workflow: Faculty submit via portal → Admin downloads CSV → Admin uploads in Tab 1 → Run Optimizer
     uploaded_bytes = st.session_state.get("uploaded_willingness_bytes", None)
-    source = None
-    if uploaded_bytes is not None:
-        try:
-            import io
-            source = io.BytesIO(uploaded_bytes)
-        except Exception:
-            source = None
-    if source is None:
-        # No uploaded file — return empty (pending_submissions handled separately in get_all_willingness)
+    if uploaded_bytes is None:
         return pd.DataFrame(columns=["Faculty", "Date", "Session", "FacultyClean"])
-
     try:
-        xl = pd.ExcelFile(source)
+        xl = pd.ExcelFile(io.BytesIO(uploaded_bytes))
         df = None
         for sh in xl.sheet_names:
             c = xl.parse(sh)
@@ -341,7 +499,9 @@ def load_willingness():
             c = xl.parse(xl.sheet_names[0])
             c.columns = c.columns.str.strip()
             if len(c.columns) >= 3:
-                c = c.rename(columns={c.columns[0]: "Faculty", c.columns[1]: "Date", c.columns[2]: "Session"})
+                c = c.rename(columns={c.columns[0]: "Faculty",
+                                      c.columns[1]: "Date",
+                                      c.columns[2]: "Session"})
                 df = c[["Faculty", "Date", "Session"]].copy()
             else:
                 df = pd.DataFrame(columns=["Faculty", "Date", "Session"])
@@ -364,16 +524,31 @@ def get_all_willingness():
     return combined
 
 def save_submission(faculty_name, slots):
+    """Save (or replace) willingness for a faculty — allows resubmission."""
     new_rows = pd.DataFrame([
         {"Faculty": faculty_name,
-         "Date": item["Date"].strftime("%d-%m-%Y"),
+         "Date":    item["Date"].strftime("%d-%m-%Y"),
          "Session": item["Session"]}
         for item in slots
     ])
     if "pending_submissions" not in st.session_state:
-        st.session_state.pending_submissions = pd.DataFrame(columns=["Faculty", "Date", "Session"])
+        st.session_state.pending_submissions = pd.DataFrame(
+            columns=["Faculty", "Date", "Session"])
+    # Remove any previous submission from this faculty before adding new one
+    existing = st.session_state.pending_submissions
+    existing = existing[existing["Faculty"] != faculty_name]
     st.session_state.pending_submissions = pd.concat(
-        [st.session_state.pending_submissions, new_rows], ignore_index=True)
+        [existing, new_rows], ignore_index=True)
+
+def already_submitted(faculty_name: str) -> bool:
+    wl = load_willingness()
+    sel_clean = clean(faculty_name)
+    from_file = (sel_clean in wl["FacultyClean"].tolist()
+                 if not wl.empty and "FacultyClean" in wl.columns else False)
+    pend = st.session_state.get(
+        "pending_submissions", pd.DataFrame(columns=["Faculty", "Date", "Session"]))
+    from_pend = (faculty_name in pend["Faculty"].tolist() if not pend.empty else False)
+    return from_file or from_pend
 
 
 # ═══════════════════════════════════════════════════════════════ #
@@ -384,8 +559,7 @@ def slot_probability(all_will_df, duty_df, date_val, session_val):
     if not duty_df.empty:
         m = duty_df[
             (duty_df["Date"].dt.date == date_val) &
-            (duty_df["Session"].str.upper() == session_val.upper())
-        ]
+            (duty_df["Session"].str.upper() == session_val.upper())]
         if not m.empty:
             seats = int(m["Required"].sum())
 
@@ -398,25 +572,21 @@ def slot_probability(all_will_df, duty_df, date_val, session_val):
         ).sum())
 
     if seats == 0:
-        prob, label, colour = 0.0, "No slot on this day", "#94a3b8"
-    elif applicants == 0:
-        prob, label, colour = 100.0, "High — you'd be first!", "#16a34a"
-    else:
-        prob = min(seats / applicants, 1.0) * 100
-        if prob >= 70:
-            prob, label, colour = prob, "High", "#16a34a"
-        elif prob >= 40:
-            prob, label, colour = prob, "Medium", "#f59e0b"
-        else:
-            prob, label, colour = prob, "Low — many applicants", "#dc2626"
-
+        return {"seats": 0, "applicants": applicants,
+                "probability": 0.0, "label": "No slot on this day", "colour": "#94a3b8"}
+    if applicants == 0:
+        return {"seats": seats, "applicants": 0,
+                "probability": 100.0, "label": "High — you'd be first!", "colour": "#16a34a"}
+    prob = min(seats / applicants, 1.0) * 100
+    if prob >= 70:   label, colour = "High",                "#16a34a"
+    elif prob >= 40: label, colour = "Medium",              "#f59e0b"
+    else:            label, colour = "Low — many applicants","#dc2626"
     return {"seats": seats, "applicants": applicants,
             "probability": prob, "label": label, "colour": colour}
 
 def render_prob_bar(info: dict, session_label: str):
     pct    = info["probability"]
     colour = info["colour"]
-    w      = f"{pct:.0f}%"
     st.markdown(f"""
 <div style="background:#fff;border:1px solid #e2e8f0;border-radius:10px;
             padding:10px 14px;margin-bottom:8px;">
@@ -425,69 +595,66 @@ def render_prob_bar(info: dict, session_label: str):
     <span style="color:{colour}">{pct:.0f}% allocation probability</span>
   </div>
   <div style="background:#e5e7eb;border-radius:6px;height:12px;width:100%;margin:4px 0">
-    <div style="background:{colour};border-radius:6px;height:12px;width:{w}"></div>
+    <div style="background:{colour};border-radius:6px;height:12px;width:{pct:.0f}%"></div>
   </div>
   <div style="font-size:.82rem;color:#475569;margin-top:3px;">
     🎯 Seats: <b>{info['seats']}</b> &nbsp;|&nbsp;
     👥 Applied so far: <b>{info['applicants']}</b> &nbsp;|&nbsp;
     {info['label']}
   </div>
-</div>
-""", unsafe_allow_html=True)
+</div>""", unsafe_allow_html=True)
 
 
 # ═══════════════════════════════════════════════════════════════ #
-#        DEVIATION ANALYSIS  (admin-only helper)                 #
+#        DEVIATION ANALYSIS  (admin-only)                        #
 # ═══════════════════════════════════════════════════════════════ #
 def classify_duty(alloc_by: str, duty_date, duty_sess: str, will_set: set):
     ab = str(alloc_by).strip()
-
     if ab == "Willingness-Exact":
         return ("Exact Match", "✅",
                 "Allotted on your exact submitted date & session", True)
-
     if ab == "Willingness-ACPOnline":
         return ("Session Adjusted", "🔄",
                 "Your offline-date willingness was used to fill your online duty slot", True)
-
     if ab == "Willingness-SessionFlip":
         opp = "AN" if duty_sess == "FN" else "FN"
         return ("Session Adjusted", "🔄",
                 f"You submitted {duty_date.strftime('%d-%m-%Y')} {opp} → allotted {duty_sess} "
                 f"(same date, session swapped)", True)
-
     if ab == "Willingness-±1Day":
         closest = ""
         for direction in [1, -1]:
             adj = duty_date + datetime.timedelta(days=direction)
             for s in ["FN", "AN"]:
                 if (adj, s) in will_set:
-                    direction_lbl = "after" if direction > 0 else "before"
+                    d = "after" if direction > 0 else "before"
                     closest = (f"You submitted {adj.strftime('%d-%m-%Y')} {s} "
-                               f"→ duty shifted 1 working day {direction_lbl} "
+                               f"→ duty shifted 1 working day {d} "
                                f"to {duty_date.strftime('%d-%m-%Y')} {duty_sess}")
                     break
             if closest: break
         return ("Date Adjusted (±1 day)", "📅",
-                closest or f"Allotted 1 working day from your submitted willingness", True)
-
+                closest or "Allotted 1 working day from your submitted willingness", True)
+    if ab == "Willingness-±2Day":
+        return ("Date Adjusted (±2 days)", "📆",
+                f"Allotted 2 working days from your submitted willingness "
+                f"({duty_date.strftime('%d-%m-%Y')} {duty_sess})", True)
+    if ab == "SAP-OnlineFallback":
+        return ("SAP Online Fallback", "🔁",
+                "SAP faculty assigned to online slot as fallback (P/ACP unavailable)", True)
     if ab == "Willingness-ValAdj":
         return ("Valuation-Adjacent", "🗓️",
                 f"Allotted on a weekday adjacent to your valuation date "
                 f"({duty_date.strftime('%d-%m-%Y')} {duty_sess})", True)
-
-    if ab in ("Auto-Assigned", "Gap-Fill"):
+    if ab in ("Auto-Assigned", "Gap-Fill") or ab.startswith("Gap-Fill"):
         return ("Auto-Assigned", "⚙️",
                 "No willingness submitted — system assigned this duty to meet slot requirements",
                 False)
-
     return ("Not in Willingness", "🔴",
             f"No willingness found near {duty_date.strftime('%d-%m-%Y')} {duty_sess} "
             f"— system assigned to meet slot requirements", False)
 
-
 def render_deviation_section(allot_rows: pd.DataFrame, will_set: set):
-    """Admin-only: full deviation analysis with metrics, per-duty table, and summary."""
     if allot_rows.empty:
         st.info("No allotment data found for this faculty yet.")
         return "Not available", []
@@ -495,99 +662,77 @@ def render_deviation_section(allot_rows: pd.DataFrame, will_set: set):
     duty_rows = []
     for _, ar in allot_rows.iterrows():
         norm = pd.to_datetime(ar["Date"], dayfirst=True, errors="coerce")
-        if pd.isna(norm):
-            continue
+        if pd.isna(norm): continue
         sess     = str(ar.get("Session", "")).strip().upper()
         dtype    = str(ar.get("Type", "")).strip()
         alloc_by = str(ar.get("Allocated_By", "")).strip()
         status, emoji, detail, is_matched = classify_duty(
             alloc_by, norm.date(), sess, will_set)
         duty_rows.append({
-            "norm_date":  norm.date(),
-            "sess":       sess,
-            "dtype":      dtype,
-            "status":     status,
-            "emoji":      emoji,
-            "detail":     detail,
+            "norm_date": norm.date(), "sess": sess, "dtype": dtype,
+            "status": status, "emoji": emoji, "detail": detail,
             "is_matched": is_matched,
-            "date_fmt":   fmt_day(norm.strftime("%d-%m-%Y")),
+            "date_fmt": fmt_day(norm.strftime("%d-%m-%Y")),
         })
 
-    total     = len(duty_rows)
-    n_exact   = sum(1 for d in duty_rows if d["status"] == "Exact Match")
-    n_sess    = sum(1 for d in duty_rows if d["status"] == "Session Adjusted")
-    n_adj     = sum(1 for d in duty_rows if "Date Adjusted" in d["status"])
-    n_valadj  = sum(1 for d in duty_rows if d["status"] == "Valuation-Adjacent")
-    n_no      = sum(1 for d in duty_rows if not d["is_matched"])
-    n_matched = n_exact + n_sess + n_adj + n_valadj
-
+    total    = len(duty_rows)
+    n_exact  = sum(1 for d in duty_rows if d["status"] == "Exact Match")
+    n_sess   = sum(1 for d in duty_rows if d["status"] == "Session Adjusted")
+    n_adj1   = sum(1 for d in duty_rows if d["status"] == "Date Adjusted (±1 day)")
+    n_adj2   = sum(1 for d in duty_rows if d["status"] == "Date Adjusted (±2 days)")
+    n_valadj = sum(1 for d in duty_rows if d["status"] == "Valuation-Adjacent")
+    n_no     = sum(1 for d in duty_rows if not d["is_matched"])
+    n_matched = n_exact + n_sess + n_adj1 + n_adj2 + n_valadj
     match_pct = n_matched / total * 100 if total else 0.0
     dev_pct   = 100.0 - match_pct
-
-    allot_set    = {(d["norm_date"], d["sess"]) for d in duty_rows}
+    allot_set = {(d["norm_date"], d["sess"]) for d in duty_rows}
     exact_overlap = len(will_set & allot_set)
     will_used_pct = exact_overlap / len(will_set) * 100 if will_set else 0.0
 
     st.markdown("---")
     st.markdown("### 📊 Willingness Match & Deviation")
-
     m1, m2, m3, m4 = st.columns(4)
-    with m1:
-        st.metric("Duties Allotted", total)
-    with m2:
-        st.metric("Willingness Match", f"{match_pct:.1f}%",
-                  delta=f"{n_matched} of {total} within window")
-    with m3:
-        st.metric("Deviation", f"{dev_pct:.1f}%",
-                  delta=f"{n_no} unmatched" if n_no else "None",
-                  delta_color="inverse" if n_no else "off")
-    with m4:
-        st.metric("Your Exact Slots Used", f"{will_used_pct:.1f}%",
-                  help=f"{exact_overlap} of your {len(will_set)} submitted slots allotted exactly")
+    with m1: st.metric("Duties Allotted", total)
+    with m2: st.metric("Willingness Match", f"{match_pct:.1f}%",
+                       delta=f"{n_matched} of {total} within window")
+    with m3: st.metric("Deviation", f"{dev_pct:.1f}%",
+                       delta=f"{n_no} unmatched" if n_no else "None",
+                       delta_color="inverse" if n_no else "off")
+    with m4: st.metric("Your Exact Slots Used", f"{will_used_pct:.1f}%",
+                       help=f"{exact_overlap} of your {len(will_set)} submitted slots allotted exactly")
 
     if total == 0:
         return "Not available", []
     elif dev_pct == 0.0:
         st.success("🎉 All duties were allotted exactly as per submitted willingness!")
     elif n_no == 0:
-        st.info(
-            f"ℹ️ All {total} duties fall within the willingness window. "
-            f"{n_sess + n_adj} minor adjustment(s) were made "
-            f"(session swap or date shift of ±1/±2 days)."
-        )
+        st.info(f"ℹ️ All {total} duties fall within the willingness window. "
+                f"{n_sess + n_adj1 + n_adj2} minor adjustment(s) made.")
     else:
-        st.warning(
-            f"⚠️ {n_no} of {total} duties could not be matched to any submitted willingness "
-            "and were system-assigned to meet examination slot requirements."
-        )
-
-    st.markdown("#### Duty-wise Breakdown")
+        st.warning(f"⚠️ {n_no} of {total} duties could not be matched and were system-assigned.")
 
     STATUS_BG = {
-        "Exact Match":            ("#d1fae5", "#065f46"),
-        "Session Adjusted":       ("#fef3c7", "#92400e"),
-        "Date Adjusted (±1 day)": ("#ffedd5", "#9a3412"),
-        "Valuation-Adjacent":     ("#ede9fe", "#5b21b6"),
-        "Not in Willingness":     ("#fee2e2", "#991b1b"),
-        "Auto-Assigned":          ("#e5e7eb", "#374151"),
+        "Exact Match":              ("#d1fae5", "#065f46"),
+        "Session Adjusted":         ("#fef3c7", "#92400e"),
+        "Date Adjusted (±1 day)":   ("#ffedd5", "#9a3412"),
+        "Date Adjusted (±2 days)":  ("#ffe4e6", "#881337"),
+        "Valuation-Adjacent":       ("#ede9fe", "#5b21b6"),
+        "Not in Willingness":       ("#fee2e2", "#991b1b"),
+        "Auto-Assigned":            ("#e5e7eb", "#374151"),
     }
-
     rows_html = ""
     for d in duty_rows:
         bg, fg = STATUS_BG.get(d["status"], ("#e5e7eb", "#374151"))
-        rows_html += f"""
-<tr>
-  <td style="padding:7px 10px;font-size:.87rem;">{d['date_fmt']}</td>
-  <td style="padding:7px 10px;text-align:center;font-weight:700">{d['sess']}</td>
-  <td style="padding:7px 10px;text-align:center;">{d['dtype']}</td>
-  <td style="padding:7px 10px;">
-    <span style="display:inline-block;padding:2px 10px;border-radius:12px;
-                 font-size:.8rem;font-weight:700;background:{bg};color:{fg};">
-      {d['emoji']} {d['status']}
-    </span>
-  </td>
-  <td style="padding:7px 10px;font-size:.82rem;color:#475569;">{d['detail']}</td>
-</tr>"""
+        rows_html += (
+            f"<tr>"
+            f"<td style='padding:7px 10px;font-size:.87rem'>{d['date_fmt']}</td>"
+            f"<td style='padding:7px 10px;text-align:center;font-weight:700'>{d['sess']}</td>"
+            f"<td style='padding:7px 10px;text-align:center'>{d['dtype']}</td>"
+            f"<td style='padding:7px 10px'><span style='display:inline-block;padding:2px 10px;"
+            f"border-radius:12px;font-size:.8rem;font-weight:700;background:{bg};color:{fg}'>"
+            f"{d['emoji']} {d['status']}</span></td>"
+            f"<td style='padding:7px 10px;font-size:.82rem;color:#475569'>{d['detail']}</td>"
+            f"</tr>")
 
     st.markdown(f"""
 <div style="overflow-x:auto">
@@ -603,9 +748,7 @@ def render_deviation_section(allot_rows: pd.DataFrame, will_set: set):
     </tr>
   </thead>
   <tbody>{rows_html}</tbody>
-</table>
-</div>
-""", unsafe_allow_html=True)
+</table></div>""", unsafe_allow_html=True)
 
     st.markdown("#### Summary by Category")
     bd = pd.DataFrame({
@@ -613,37 +756,34 @@ def render_deviation_section(allot_rows: pd.DataFrame, will_set: set):
             "✅ Exact Match",
             "🔄 Session Adjusted (FN↔AN, same date)",
             "📅 Date Adjusted (±1 working day)",
+            "📆 Date Adjusted (±2 working days)",
             "🗓️ Valuation-Adjacent (day before/after val date)",
             "🔴 Not in Willingness / Auto-Assigned",
         ],
-        "Count": [n_exact, n_sess, n_adj, n_valadj, n_no],
-        "Share %": [
-            f"{n_exact/total*100:.1f}%"   if total else "—",
-            f"{n_sess/total*100:.1f}%"    if total else "—",
-            f"{n_adj/total*100:.1f}%"     if total else "—",
-            f"{n_valadj/total*100:.1f}%"  if total else "—",
-            f"{n_no/total*100:.1f}%"      if total else "—",
-        ],
+        "Count": [n_exact, n_sess, n_adj1, n_adj2, n_valadj, n_no],
+        "Share %": [f"{v/total*100:.1f}%" if total else "—"
+                    for v in [n_exact, n_sess, n_adj1, n_adj2, n_valadj, n_no]],
         "Meaning": [
             "Allotted on the exact date & session you submitted",
             "Same date, but morning/afternoon slot was swapped",
             "Duty shifted by 1 working day from your submitted date",
+            "Duty shifted by 2 working days from your submitted date",
             "Allotted on a weekday adjacent to your valuation date",
             "No matching date — system assigned to fill slot",
         ],
     })
     st.dataframe(bd, use_container_width=True, hide_index=True)
 
-    dev_lines = [f"Overall match: {match_pct:.1f}%  ({n_matched}/{total} duties within willingness window)"]
+    dev_lines = [f"Overall match: {match_pct:.1f}%  ({n_matched}/{total} duties within window)"]
     if n_no == 0 and dev_pct == 0:
         dev_lines.append("All duties allotted exactly as per your willingness.")
     else:
-        if n_exact   > 0: dev_lines.append(f"  ✅ Exact match          : {n_exact} duty(ies)")
-        if n_sess    > 0: dev_lines.append(f"  🔄 Session swapped      : {n_sess} duty(ies) (FN↔AN, same date)")
-        if n_adj     > 0: dev_lines.append(f"  📅 Date shifted         : {n_adj} duty(ies) (±1 working day)")
-        if n_valadj  > 0: dev_lines.append(f"  🗓️ Valuation-adjacent   : {n_valadj} duty(ies) (day before/after val date)")
-        if n_no      > 0: dev_lines.append(f"  🔴 System-assigned      : {n_no} duty(ies) (outside willingness window)")
-
+        if n_exact  > 0: dev_lines.append(f"  ✅ Exact match        : {n_exact} duty(ies)")
+        if n_sess   > 0: dev_lines.append(f"  🔄 Session swapped   : {n_sess} duty(ies)")
+        if n_adj1   > 0: dev_lines.append(f"  📅 Date shifted ±1   : {n_adj1} duty(ies)")
+        if n_adj2   > 0: dev_lines.append(f"  📆 Date shifted ±2   : {n_adj2} duty(ies)")
+        if n_valadj > 0: dev_lines.append(f"  🗓️ Val-adjacent      : {n_valadj} duty(ies)")
+        if n_no     > 0: dev_lines.append(f"  🔴 System-assigned   : {n_no} duty(ies)")
     match_str = f"Match {match_pct:.1f}%  ({n_matched}/{total})  |  Deviation {dev_pct:.1f}%"
     return match_str, dev_lines
 
@@ -651,52 +791,23 @@ def render_deviation_section(allot_rows: pd.DataFrame, will_set: set):
 # ═══════════════════════════════════════════════════════════════ #
 #                    CALENDAR HEATMAP                            #
 # ═══════════════════════════════════════════════════════════════ #
-def demand_cat(r):
-    if r == 0:   return "No Duty"
-    if r < 3:    return "Low (<3)"
-    if r <= 7:   return "Medium (3-7)"
-    return "High (>7)"
-
-def calendar_frame(duty_df, val_dates, year, month):
-    sg   = duty_df.groupby(["Date", "Session"], as_index=False)["Required"].sum()
-    dmap = {(d.date(), s): int(r) for d, s, r in zip(sg["Date"], sg["Session"], sg["Required"])}
-    ms   = pd.Timestamp(year=year, month=month, day=1)
-    fw   = ms.weekday()
-    WD   = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-    rows = []
-    for dt in pd.date_range(ms, ms + pd.offsets.MonthEnd(0), freq="D"):
-        wk = ((dt.day + fw - 1) // 7) + 1
-        do = dt.date()
-        for sess in ["FN", "AN"]:
-            req = dmap.get((do, sess), 0)
-            cat = "Valuation Locked" if do in val_dates else demand_cat(req)
-            rows.append({"Date": dt, "Week": wk, "Weekday": WD[dt.weekday()],
-                         "DayNum": dt.day, "Session": sess, "Required": req,
-                         "Category": cat, "DateLabel": dt.strftime("%d-%m-%Y")})
-    return pd.DataFrame(rows)
-
 def render_calendar(duty_df, val_dates, title):
     st.markdown(f"#### {title}")
     if duty_df.empty:
         st.info("No slot data available.")
         return
 
-    # Only render months that actually contain exam slots
     slot_day_set = set(duty_df["Date"].dt.date)
-    if slot_day_set:
-        first_slot = min(slot_day_set)
-        last_slot  = max(slot_day_set)
-    else:
+    if not slot_day_set:
         return
+    first_slot = min(slot_day_set)
+    last_slot  = max(slot_day_set)
 
     months = sorted({(d.year, d.month) for d in duty_df["Date"]})
-
     sg = duty_df.groupby(["Date", "Session"], as_index=False)["Required"].sum()
-    duty_map = {}
-    for _, row in sg.iterrows():
-        duty_map[(row["Date"].date(), str(row["Session"]).upper())] = int(row["Required"])
-
-    val_set = set(val_dates)
+    duty_map = {(row["Date"].date(), str(row["Session"]).upper()): int(row["Required"])
+                for _, row in sg.iterrows()}
+    val_set  = set(val_dates)
     WD_ORDER = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
     st.markdown(
@@ -705,194 +816,160 @@ def render_calendar(duty_df, val_dates, title):
         "padding:2px 8px;margin-right:6px'>🩷 Valuation Locked</span>"
         "<span style='background:#fff;border:1px solid #cbd5e1;border-radius:4px;"
         "padding:2px 8px'>🔢 Number = duties required on that day/session</span>"
-        "</span>",
-        unsafe_allow_html=True
-    )
+        "</span>", unsafe_allow_html=True)
     st.markdown("")
 
     for yr, mo in months:
         ms   = pd.Timestamp(year=yr, month=mo, day=1)
         me   = ms + pd.offsets.MonthEnd(0)
         days = pd.date_range(ms, me, freq="D")
-
-        fw = ms.weekday()
-        grid = []
-        week = [None] * fw
+        fw   = ms.weekday()
+        grid = []; week = [None] * fw
         for dt in days:
-            # Only show dates within the actual exam period (first_slot to last_slot)
             dt_date = dt.date()
-            cell = dt_date if (dt_date >= first_slot and dt_date <= last_slot) else None
+            cell = dt_date if (first_slot <= dt_date <= last_slot) else None
             week.append(cell)
             if len(week) == 7:
-                grid.append(week)
-                week = []
+                grid.append(week); week = []
         if week:
-            week += [None] * (7 - len(week))
-            grid.append(week)
-        # Remove entirely-empty weeks (all None) that fall outside exam period
+            week += [None] * (7 - len(week)); grid.append(week)
         grid = [w for w in grid if any(d is not None for d in w)]
 
         st.markdown(
             f"<div style='font-size:.95rem;font-weight:700;color:#1e3a5f;"
             f"margin:14px 0 4px 0'>{calmod.month_name[mo]} {yr}</div>",
-            unsafe_allow_html=True
-        )
+            unsafe_allow_html=True)
 
-        TH_DAY = (
-            "background:#1e3a5f;color:#fff;font-size:.8rem;font-weight:700;"
-            "text-align:center;padding:7px 4px;border:1px solid #2d4f7c;"
-        )
-        TH_SESS = (
-            "background:#dbeafe;color:#1e40af;font-size:.7rem;font-weight:700;"
-            "text-align:center;padding:4px 2px;border:1px solid #bfdbfe;width:44px;"
-        )
-        TD_BASE = (
-            "text-align:center;padding:5px 2px;border:1px solid #e2e8f0;"
-            "vertical-align:middle;min-width:44px;"
-        )
+        TH_DAY  = ("background:#1e3a5f;color:#fff;font-size:.8rem;font-weight:700;"
+                   "text-align:center;padding:7px 4px;border:1px solid #2d4f7c;")
+        TH_SESS = ("background:#dbeafe;color:#1e40af;font-size:.7rem;font-weight:700;"
+                   "text-align:center;padding:4px 2px;border:1px solid #bfdbfe;width:44px;")
+        TD_BASE = ("text-align:center;padding:5px 2px;border:1px solid #e2e8f0;"
+                   "vertical-align:middle;min-width:44px;")
 
         hdr1 = "".join(f"<th colspan='2' style='{TH_DAY}'>{wd}</th>" for wd in WD_ORDER)
-        hdr2 = "".join(
-            f"<th style='{TH_SESS}'>FN</th><th style='{TH_SESS}'>AN</th>"
-            for _ in WD_ORDER
-        )
-
+        hdr2 = "".join(f"<th style='{TH_SESS}'>FN</th><th style='{TH_SESS}'>AN</th>"
+                       for _ in WD_ORDER)
         rows_html = ""
         for week_dates in grid:
             date_row = ""
             for dt in week_dates:
                 if dt is None:
-                    date_row += (
-                        "<td colspan='2' style='background:#ffffff;"
-                        "border:1px solid #e2e8f0;height:20px'></td>"
-                    )
+                    date_row += ("<td colspan='2' style='background:#fff;"
+                                 "border:1px solid #e2e8f0;height:20px'></td>")
                 else:
-                    is_val = dt in val_set
-                    is_sun = dt.weekday() == 6
-                    bg     = "#fce7f3" if is_val else "#ffffff"
-                    color  = "#be185d" if is_val else ("#94a3b8" if is_sun else "#0f172a")
-                    label  = f"{dt.day}" + (" 🔒" if is_val else "")
-                    date_row += (
-                        f"<td colspan='2' style='background:{bg};"
-                        f"border:1px solid #e2e8f0;text-align:center;"
-                        f"padding:4px 2px 2px 2px;vertical-align:middle'>"
-                        f"<span style='font-size:.88rem;font-weight:800;color:{color}'>"
-                        f"{label}</span></td>"
-                    )
+                    is_val = dt in val_set; is_sun = dt.weekday() == 6
+                    bg    = "#fce7f3" if is_val else "#fff"
+                    color = "#be185d" if is_val else ("#94a3b8" if is_sun else "#0f172a")
+                    label = f"{dt.day}" + (" 🔒" if is_val else "")
+                    date_row += (f"<td colspan='2' style='background:{bg};"
+                                 f"border:1px solid #e2e8f0;text-align:center;"
+                                 f"padding:4px 2px 2px 2px;vertical-align:middle'>"
+                                 f"<span style='font-size:.88rem;font-weight:800;color:{color}'>"
+                                 f"{label}</span></td>")
             rows_html += f"<tr>{date_row}</tr>"
 
             duty_row = ""
             for dt in week_dates:
                 if dt is None:
-                    duty_row += (
-                        "<td style='background:#ffffff;border:1px solid #e2e8f0;"
-                        "min-width:44px;height:24px'></td>"
-                        "<td style='background:#ffffff;border:1px solid #e2e8f0;"
-                        "min-width:44px;height:24px'></td>"
-                    )
+                    duty_row += ("<td style='background:#fff;border:1px solid #e2e8f0;"
+                                 "min-width:44px;height:24px'></td>" * 2)
                 else:
                     is_val = dt in val_set
                     for sess in ["FN", "AN"]:
                         req = duty_map.get((dt, sess), 0)
                         if is_val:
-                            bg      = "#fce7f3"
-                            content = ""
+                            bg, content = "#fce7f3", ""
                         elif req == 0:
-                            bg      = "#ffffff"
-                            content = ""
+                            bg, content = "#fff", ""
                         else:
-                            bg      = "#ffffff"
-                            content = (
-                                f"<span style='font-size:.72rem;font-style:italic;"
-                                f"font-weight:700;color:#2563eb;letter-spacing:.01em'>"
-                                f"{req}</span>"
-                            )
-                        duty_row += (
-                            f"<td style='{TD_BASE}background:{bg};'>"
-                            f"{content}</td>"
-                        )
+                            bg = "#fff"
+                            content = (f"<span style='font-size:.72rem;font-style:italic;"
+                                       f"font-weight:700;color:#2563eb'>{req}</span>")
+                        duty_row += f"<td style='{TD_BASE}background:{bg}'>{content}</td>"
             rows_html += f"<tr>{duty_row}</tr>"
 
-        table_html = f"""
+        st.markdown(f"""
 <div style="overflow-x:auto;margin-bottom:20px;border-radius:10px;
             box-shadow:0 2px 12px rgba(15,23,42,.08);border:1px solid #e2e8f0">
 <table style="border-collapse:collapse;width:100%;table-layout:fixed;
               font-family:Inter,sans-serif;border-radius:10px;overflow:hidden">
-  <thead>
-    <tr>{hdr1}</tr>
-    <tr>{hdr2}</tr>
-  </thead>
+  <thead><tr>{hdr1}</tr><tr>{hdr2}</tr></thead>
   <tbody>{rows_html}</tbody>
-</table>
-</div>
-"""
-        st.markdown(table_html, unsafe_allow_html=True)
+</table></div>""", unsafe_allow_html=True)
 
     st.caption("FN = Forenoon  |  AN = Afternoon  |  Numbers = duties required on that day/session")
 
 
 # ═══════════════════════════════════════════════════════════════ #
-#           OPTIMIZER  (Greedy + Slot Completion)                #
+#   OPTIMIZER  — MILP (scipy HiGHS) + Smart Greedy + CP-SAT     #
 # ═══════════════════════════════════════════════════════════════ #
-def run_optimizer(log_box):
-    log_lines = []
-    def log(m=""):
-        log_lines.append(m)
-        log_box.code("\n".join(log_lines), language="text")
+def _load_core(log):
+    if not SCIPY_OK:
+        raise RuntimeError("scipy not installed. Run:  pip install scipy")
 
-    log("=" * 62)
-    log("  SASTRA SoME Duty Optimizer  (Greedy + Slot Completion)")
-    log("  Slot-fill guaranteed | val-safe | session-flip |")
-    log("  ±1 biz-day adj | Sat→TA/RA | seniority | ACP 1+1")
-    log("=" * 62)
-
-    if not ORTOOLS_OK:
-        raise RuntimeError(
-            "OR-Tools not installed. Run: pip install ortools")
-
-    # ── Load faculty ─────────────────────────────────────────────
     fr = pd.read_excel(FACULTY_FILE)
     fr.columns = fr.columns.str.strip()
-    col_names  = fr.columns.tolist()
-    if len(col_names) < 2:
-        raise RuntimeError("Faculty_Master.xlsx must have at least 2 columns.")
-    fr.rename(columns={col_names[0]: "Name", col_names[1]: "Designation"}, inplace=True)
+
+    # Flexible column detection (same logic as main)
+    def _nc(c): return str(c).strip().upper().replace(".", "").replace(" ", "").replace("_", "")
+    _cmap = {_nc(c): c for c in fr.columns}
+    _id_col = (
+        _cmap.get("IDNO") or _cmap.get("IDNUM") or _cmap.get("IDNUMBER")
+        or _cmap.get("FACULTYID")
+        or (_cmap.get("ID") if _cmap.get("ID") and
+            _nc(_cmap.get("ID")) not in ("SNO", "SLNO", "SRNO") else None)
+    )
+    _name_col = (
+        _cmap.get("NAMEOFSTAFF") or _cmap.get("STAFFNAME")
+        or _cmap.get("FACULTYNAME") or _cmap.get("NAME")
+    )
+    _desig_col = _cmap.get("DESIGNATION") or _cmap.get("DESIG") or _cmap.get("POST")
+    if _id_col and _name_col:
+        _rename = {_id_col: "ID No.", _name_col: "Name"}
+        if _desig_col and _desig_col not in _rename:
+            _rename[_desig_col] = "Designation"
+        fr = fr.rename(columns=_rename)
+        fr["ID No."] = (
+            fr["ID No."].astype(str).str.strip().str.upper()
+            .str.replace(" ", "", regex=False)
+        )
+        fr = fr[~fr["ID No."].isin(["", "NAN", "NONE"])].copy()
+    else:
+        cols = fr.columns.tolist()
+        fr.rename(columns={cols[0]: "Name", cols[1]: "Designation"}, inplace=True)
+
     fr = fr.dropna(subset=["Name"]).reset_index(drop=True)
     fr["Name"]        = fr["Name"].astype(str).str.strip()
-    fr["Designation"] = fr["Designation"].astype(str).str.strip().str.upper()
+    fr["Designation"] = (
+        fr["Designation"].astype(str).str.strip()
+        .apply(lambda x: DESIG_MAP.get(x.lower(), x.upper()))
+    )
 
     ALL_FAC = fr["Name"].tolist()
     FAC_IDX = {n: i for i, n in enumerate(ALL_FAC)}
     N_FAC   = len(ALL_FAC)
-    fac_d   = {row["Name"]: (row["Designation"] if row["Designation"] in DESIG_RULES else "TA")
-               for _, row in fr.iterrows()}
-
-    # ── ACP type limits ───────────────────────────────────────────
-    # Online limit raised to 2 so unfilled online slots can be covered
-    # when P-faculty alone are insufficient (e.g. 24-May, 31-May FN)
-    acp_online_limit  = {n: 2 for n in ALL_FAC if fac_d.get(n) == "ACP"}
-    acp_offline_limit = {n: 1 for n in ALL_FAC if fac_d.get(n) == "ACP"}
-
+    fac_d   = {r["Name"]: (r["Designation"] if r["Designation"] in DESIG_RULES else "TA")
+               for _, r in fr.iterrows()}
     dgroups = defaultdict(list)
     for n, d in fac_d.items():
         dgroups[d].append(n)
-    log(f"\n  Faculty loaded     : {N_FAC}")
 
-    # ── Per-faculty valuation dates ──────────────────────────────
-    fac_val_dates = {}
-    for _, frow in fr.iterrows():
-        fname  = frow["Name"]
-        vdates = set()
-        for c in ["V1", "V2", "V3", "V4", "V5"]:
-            if c in frow.index and pd.notna(frow[c]):
-                try:
-                    vdates.add(pd.to_datetime(frow[c], dayfirst=True).date())
-                except Exception:
-                    pass
-        fac_val_dates[fname] = vdates
-    log(f"  Valuation dates    : {sum(1 for v in fac_val_dates.values() if v)} faculty")
+    fac_val = {}
+    for _, r in fr.iterrows():
+        vd = set()
+        for c in ["V1","V2","V3","V4","V5"]:
+            if c in r.index and pd.notna(r[c]):
+                try: vd.add(pd.to_datetime(r[c], dayfirst=True).date())
+                except: pass
+        fac_val[r["Name"]] = vd
 
-    # ── Load willingness ─────────────────────────────────────────
+    s_off = parse_duty_file(OFFLINE_FILE, "Offline")
+    s_on  = parse_duty_file(ONLINE_FILE,  "Online")
+    ALL_S = s_off + s_on
+    NS    = len(ALL_S)
+    slot_dates = {s["date"] for s in ALL_S}
+
     wdf = get_all_willingness().drop(columns=["FacultyClean"], errors="ignore")
     if not wdf.empty:
         wdf["Date"]    = pd.to_datetime(wdf["Date"], dayfirst=True, errors="coerce")
@@ -900,343 +977,192 @@ def run_optimizer(log_box):
         wdf = wdf.dropna(subset=["Date"])
     submitted  = set(wdf["Faculty"].str.strip().unique()) if not wdf.empty else set()
     non_sub    = [n for n in ALL_FAC if n not in submitted]
-
     sub_counts = {}
     if not wdf.empty:
         for n, grp in wdf.groupby("Faculty"):
             sub_counts[n.strip()] = len(grp)
 
-    under_sub = []
-    for n in submitted:
-        required = DESIG_RULES.get(fac_d.get(n, "TA"), (0,0))[0]
-        given    = sub_counts.get(n, 0)
-        if given < required:
-            under_sub.append((n, given, required))
+    log(f"  Faculty        : {N_FAC}")
+    log(f"  Slots          : {NS}  ({len(s_off)} offline + {len(s_on)} online)")
+    log(f"  Seats needed   : {sum(s['required'] for s in ALL_S)}")
+    log(f"  Willingness    : {len(submitted)} submitted | {len(non_sub)} not submitted")
 
-    log(f"  Willingness loaded : {len(submitted)} submitted | {len(non_sub)} not submitted")
-    if under_sub:
-        log(f"  ⚠ Under-submitted  : {len(under_sub)} faculty submitted fewer dates than required:")
-        for n, given, req in sorted(under_sub, key=lambda x: x[0]):
-            log(f"      {n}  →  submitted {given} / required {req}")
-    if non_sub:
-        log(f"  ⚠ No submission    : {len(non_sub)} faculty — will be auto-assigned:")
-        for n in non_sub:
-            log(f"      {n}")
+    SAT_DESIG = {"TA", "RA"}
+    sap_faculty  = [n for n in ALL_FAC if fac_d.get(n) == "SAP"]
+    sap_fallback = sap_faculty[:2]
+    acp_faculty  = [n for n in ALL_FAC if fac_d.get(n) == "ACP"]
+    acp_2online  = set(acp_faculty[:2])
+    acp_2offline = set(acp_faculty[-2:])
 
-    log("")
-    for fp, lbl in [(OFFLINE_FILE, "Offline"), (ONLINE_FILE, "Online")]:
-        log(f"  {lbl:8} : {'✓ found' if os.path.exists(fp) else '✗ MISSING — ' + fp}")
+    log(f"\n  ── Capacity Check ───────────────────────────────────")
+    any_cap_warn = False
+    for sl in ALL_S:
+        avail = 0
+        for fn in ALL_FAC:
+            d2 = fac_d.get(fn, "TA")
+            allowed = DESIG_RULES[d2][2]
+            eff_allowed = list(allowed)
+            if fn in sap_fallback and "Online" not in eff_allowed:
+                eff_allowed = eff_allowed + ["Online"]
+            if sl["type"] not in eff_allowed: continue
+            if sl["type"] == "Offline" and sl["date"] in fac_val.get(fn, set()): continue
+            if sl["type"] == "Offline" and sl["date"].weekday() == 5 and d2 not in SAT_DESIG: continue
+            if sl["type"] == "Online"  and sl["date"].weekday() == 5 and d2 not in {"P", "ACP"}: continue
+            avail += 1
+        if avail < sl["required"]:
+            ds = sl["date"].strftime("%d-%m-%Y")
+            log(f"  ⚠ {ds} {sl['session']} {sl['type']} — need {sl['required']} avail {avail}")
+            any_cap_warn = True
+    if not any_cap_warn:
+        log(f"  ✓ All {NS} slots have sufficient eligible faculty")
 
-    # ── Load slots ───────────────────────────────────────────────
-    s_off = parse_duty_file(OFFLINE_FILE, "Offline")
-    s_on  = parse_duty_file(ONLINE_FILE,  "Online")
-    ALL_S = s_off + s_on
-    NS    = len(ALL_S)
-    if NS == 0:
-        raise RuntimeError("No exam slots found. Check Offline_Duty.xlsx / Online_Duty.xlsx.")
-    log(f"  Slots parsed       : {NS}  ({len(s_off)} offline + {len(s_on)} online)")
-    log(f"  Total seats needed : {sum(s['required'] for s in ALL_S)}")
-
-    SAT_DESIG  = {"TA", "RA"}
-    slot_dates = {s["date"] for s in ALL_S}
-
-    def is_weekend(d): return d.weekday() >= 5
-
-    def next_biz_day(d, steps):
+    fexp = defaultdict(dict)
+    def sset(d, k, val): d[k] = max(d.get(k, 0), val)
+    def next_biz(d, steps):
         step = 1 if steps > 0 else -1
-        cur  = d
-        cnt  = 0
+        cur = d; cnt = 0
         while cnt < abs(steps):
             cur += datetime.timedelta(days=step)
-            if not is_weekend(cur):
-                cnt += 1
+            if cur.weekday() < 5: cnt += 1
         return cur
 
-    # ── Score matrix ─────────────────────────────────────────────
-    fexp         = defaultdict(dict)
-    fac_will_set = defaultdict(set)
-
-    def set_score(d, k, val):
-        d[k] = max(d.get(k, 0), val)
-
     for _, row in wdf.iterrows():
-        n = str(row.get("Faculty", "")).strip()
-        if n not in FAC_IDX:
-            continue
-        dt2     = row["Date"].date()
-        sess    = str(row["Session"]).strip().upper()
-        opp     = "AN" if sess == "FN" else "FN"
+        n = str(row.get("Faculty","")).strip()
+        if n not in FAC_IDX: continue
+        dt2  = row["Date"].date()
+        sess = str(row["Session"]).strip().upper()
+        opp  = "AN" if sess == "FN" else "FN"
         allowed = DESIG_RULES[fac_d.get(n, "TA")][2]
-        fac_will_set[n].add((dt2, sess))
-
         for tp in allowed:
-            set_score(fexp[n], (dt2, sess, tp), W_EXACT)
-
+            sset(fexp[n], (dt2, sess, tp), W_EXACT)
         if fac_d.get(n) == "ACP":
-            for s2 in ["FN", "AN"]:
-                set_score(fexp[n], (dt2, s2, "Online"), W_ACP_ONLINE)
-
+            for s2 in ["FN","AN"]:
+                sset(fexp[n], (dt2, s2, "Online"), W_ACP_ONLINE)
+            for direction in [+1,-1]:
+                adj = next_biz(dt2, direction)
+                if adj in slot_dates:
+                    for s2 in ["FN","AN"]:
+                        sset(fexp[n], (adj, s2, "Online"), W_ACP_ONLINE - 5_000)
         for tp in allowed:
-            set_score(fexp[n], (dt2, opp, tp), W_FLIP)
-
-        for direction in [+1, -1]:
-            adj = next_biz_day(dt2, direction)
-            if adj not in slot_dates:
-                continue
-            for s2 in ["FN", "AN"]:
+            sset(fexp[n], (dt2, opp, tp), W_FLIP)
+        for direction in [+1,-1]:
+            adj = next_biz(dt2, direction)
+            if adj not in slot_dates: continue
+            for s2 in ["FN","AN"]:
                 for tp in allowed:
-                    set_score(fexp[n], (adj, s2, tp), W_ADJ1)
+                    sset(fexp[n], (adj, s2, tp), W_ADJ1)
+        for direction in [+2,-2]:
+            adj = next_biz(dt2, direction)
+            if adj not in slot_dates: continue
+            for s2 in ["FN","AN"]:
+                for tp in allowed:
+                    sset(fexp[n], (adj, s2, tp), W_ADJ2)
 
     for n in ALL_FAC:
         allowed = DESIG_RULES[fac_d.get(n, "TA")][2]
-        for vd in fac_val_dates.get(n, set()):
-            for direction in [+1, -1]:
-                adj = next_biz_day(vd, direction)
-                if adj not in slot_dates:
-                    continue
-                for s2 in ["FN", "AN"]:
+        for vd in fac_val.get(n, set()):
+            for direction in [+1,-1]:
+                adj = next_biz(vd, direction)
+                if adj not in slot_dates: continue
+                for s2 in ["FN","AN"]:
                     for tp in allowed:
                         k = (adj, s2, tp)
                         if fexp[n].get(k, 0) < W_VAL_ADJ:
-                            set_score(fexp[n], k, W_VAL_ADJ)
+                            sset(fexp[n], k, W_VAL_ADJ)
 
     for n in non_sub:
         allowed = DESIG_RULES[fac_d.get(n, "TA")][2]
         for s in ALL_S:
             if s["type"] in allowed:
-                set_score(fexp[n], (s["date"], s["session"], s["type"]), W_NON_SUB)
+                sset(fexp[n], (s["date"], s["session"], s["type"]), W_NON_SUB)
 
-    log(f"  Preference window  : exact + flip + ±1 biz-day (exam dates only)")
+    for n in ALL_FAC:
+        if fac_d.get(n) == "ACP":
+            for s in ALL_S:
+                if s["type"] == "Online":
+                    k = (s["date"], s["session"], "Online")
+                    if fexp[n].get(k, 0) == 0:
+                        sset(fexp[n], k, 1_000)
 
-    # ── Date overlap diagnostic ───────────────────────────────────
-    log(f"\n  ── Date Overlap Diagnostic ──────────────────────────")
-    slot_date_set = {s["date"] for s in ALL_S}
-    if not wdf.empty:
-        will_dates = set(wdf["Date"].dt.date.dropna())
-        overlap    = will_dates & slot_date_set
-        only_will  = will_dates - slot_date_set
-        only_slot  = slot_date_set - will_dates
-        log(f"  Slot dates         : {len(slot_date_set)}  "
-            f"({min(slot_date_set).strftime('%d-%m-%Y')} → {max(slot_date_set).strftime('%d-%m-%Y')})")
-        log(f"  Willingness dates  : {len(will_dates)}  "
-            f"({min(will_dates).strftime('%d-%m-%Y')} → {max(will_dates).strftime('%d-%m-%Y')})")
-        log(f"  ✓ Overlapping dates: {len(overlap)}")
-        if only_will:
-            log(f"  ⚠ Will-only dates  : {len(only_will)} dates NOT in any slot "
-                f"(these cannot match) — e.g. {sorted(only_will)[:3]}")
-        if only_slot:
-            log(f"  ⚠ Slot-only dates  : {len(only_slot)} slot dates with NO willingness submitted "
-                f"— e.g. {sorted(only_slot)[:3]}")
-        if len(overlap) == 0:
-            log("  ✗ CRITICAL: Zero overlap between willingness dates and slot dates!")
-            log("    → Check date format in Willingness.xlsx (must be DD-MM-YYYY or Excel date)")
-            log("    → Check that Willingness.xlsx covers the exam period")
-    else:
-        log("  ⚠ No willingness data — all assignments will be auto-assigned")
+    for n in sap_fallback:
+        for s in ALL_S:
+            if s["type"] == "Online":
+                k = (s["date"], s["session"], "Online")
+                if fexp[n].get(k, 0) == 0:
+                    sset(fexp[n], k, 500)
 
-    log(f"\n  Solver: Greedy + Slot Completion Pass")
-
-    # ── Tag helper ───────────────────────────────────────────────
     def tag(fn, k, sc):
-        if fn in non_sub:        return "Auto-Assigned"
-        if sc >= W_EXACT:        return "Willingness-Exact"
-        if sc >= W_ACP_ONLINE:   return "Willingness-ACPOnline"
-        if sc >= W_FLIP:         return "Willingness-SessionFlip"
-        if sc >= W_ADJ1:         return "Willingness-±1Day"
-        if sc >= W_VAL_ADJ:      return "Willingness-ValAdj"
+        if fn in non_sub:          return "Auto-Assigned"
+        if sc >= W_EXACT:          return "Willingness-Exact"
+        if sc >= W_ACP_ONLINE:     return "Willingness-ACPOnline"
+        if sc >= W_FLIP:           return "Willingness-SessionFlip"
+        if sc >= W_ADJ1:           return "Willingness-±1Day"
+        if sc >= W_ADJ2:           return "Willingness-±2Day"
+        if sc >= W_VAL_ADJ:        return "Willingness-ValAdj"
+        if fn in sap_fallback:     return "SAP-OnlineFallback"
         return "OR-Assigned"
 
-    # ── Greedy solver ─────────────────────────────────────────────
-    assigned = []
-    log("  Running greedy solver (seniority + willingness priority)...")
-
-    alloc_count    = defaultdict(int)
-    used_dates     = defaultdict(set)
-    acp_type_count = defaultdict(lambda: {"Online": 0, "Offline": 0})
-
-    def remaining(n):
-        return DESIG_RULES[fac_d[n]][0] - alloc_count[n]
-
-    def ok(n, dt_, tp_):
-        desig_ = fac_d[n]
-        if tp_ not in DESIG_RULES[desig_][2]:                    return False
-        if dt_ in fac_val_dates.get(n, set()):                   return False
-        if dt_ in used_dates[n]:                                  return False
-        if remaining(n) <= 0:                                     return False
-        # Saturday only allowed for TA and RA — strictly enforced
-        if dt_.weekday() == 5 and desig_ not in SAT_DESIG:       return False
-        if desig_ == "ACP":
-            if tp_ == "Online"  and acp_type_count[n]["Online"]  >= acp_online_limit.get(n, 1):  return False
-            if tp_ == "Offline" and acp_type_count[n]["Offline"] >= acp_offline_limit.get(n, 1): return False
+    def is_eligible(fn, sl):
+        d2 = fac_d.get(fn, "TA")
+        allowed = DESIG_RULES[d2][2]
+        eff = list(allowed) + (["Online"] if fn in sap_fallback else [])
+        if sl["type"] not in eff:                                    return False
+        if sl["type"] == "Offline" and sl["date"] in fac_val.get(fn, set()): return False
+        if sl["type"] == "Offline" and sl["date"].weekday() == 5 and d2 not in SAT_DESIG: return False
+        if sl["type"] == "Online"  and sl["date"].weekday() == 5 and d2 not in {"P", "ACP"}: return False
         return True
 
-    # Pass 1: fill slots largest-first
-    for sl in sorted(ALL_S, key=lambda s: -s["required"]):
-        d2, s2, r2, t2 = sl["date"], sl["session"], sl["required"], sl["type"]
-        k     = (d2, s2, t2)
-        cands = sorted(
-            [(n, fexp[n].get(k, 0)) for n in ALL_FAC if ok(n, d2, t2)],
-            key=lambda z: (
-                -DESIG_PRIORITY.get(fac_d[z[0]], 0),
-                -z[1],
-                alloc_count[z[0]]
-            ))
-        for fn, sc in cands[:r2]:
-            alloc_count[fn] += 1
-            used_dates[fn].add(d2)
-            if fac_d[fn] == "ACP":
-                acp_type_count[fn][t2] += 1
-            assigned.append({"Name": fn, "Date": d2, "Session": s2,
-                             "Type": t2, "Allocated_By": tag(fn, k, sc)})
+    return dict(
+        fr=fr, ALL_FAC=ALL_FAC, FAC_IDX=FAC_IDX, N_FAC=N_FAC,
+        fac_d=fac_d, dgroups=dgroups, fac_val=fac_val,
+        s_off=s_off, s_on=s_on, ALL_S=ALL_S, NS=NS,
+        slot_dates=slot_dates, wdf=wdf,
+        submitted=submitted, non_sub=non_sub, sub_counts=sub_counts,
+        fexp=fexp, tag=tag, is_eligible=is_eligible,
+        sap_fallback=sap_fallback, SAT_DESIG=SAT_DESIG,
+        acp_2online=acp_2online, acp_2offline=acp_2offline,
+    )
 
-    # Pass 2: fill remaining faculty duty quotas
-    for fn in ALL_FAC:
-        if remaining(fn) <= 0:
-            continue
-        for sl in sorted(ALL_S, key=lambda s: s["date"]):
-            if remaining(fn) <= 0:
-                break
-            d2, s2, t2 = sl["date"], sl["session"], sl["type"]
-            if not ok(fn, d2, t2):
-                continue
-            alloc_count[fn] += 1
-            used_dates[fn].add(d2)
-            if fac_d[fn] == "ACP":
-                acp_type_count[fn][t2] += 1
-            assigned.append({"Name": fn, "Date": d2, "Session": s2,
-                             "Type": t2, "Allocated_By": "Gap-Fill"})
 
-    # ══════════════════════════════════════════════════════════════
-    #  MANDATORY SLOT COMPLETION PASS
-    # ══════════════════════════════════════════════════════════════
-    log("\n  ── Slot Completion Pass ─────────────────────────────")
-
-    cur_alloc   = defaultdict(int)
-    cur_dates   = defaultdict(set)
-    acp_tc      = defaultdict(lambda: {"Online": 0, "Offline": 0})
-    slot_filled = defaultdict(int)
-
-    for row in assigned:
-        fn = row["Name"]; d2 = row["Date"]; t2 = row["Type"]
-        cur_alloc[fn] += 1
-        cur_dates[fn].add(d2)
-        if fac_d.get(fn) == "ACP":
-            acp_tc[fn][t2] += 1
-        slot_filled[(d2, row["Session"], t2)] += 1
-
-    gaps_before = sum(
-        max(0, sl["required"] - slot_filled.get((sl["date"], sl["session"], sl["type"]), 0))
-        for sl in ALL_S)
-    log(f"  Gaps after solver  : {gaps_before}")
-
-    for sl in ALL_S:
-        key    = (sl["date"], sl["session"], sl["type"])
-        needed = sl["required"] - slot_filled[key]
-        if needed <= 0:
-            continue
-
-        for relax in range(6):
-            if needed <= 0:
-                break
-            cands = []
-            for fn in ALL_FAC:
-                desig_ = fac_d[fn]
-                # Relax 5: ignore type constraint (last resort — any faculty fills any slot)
-                if relax < 5 and sl["type"] not in DESIG_RULES[desig_][2]:
-                    continue
-                if relax < 3 and sl["date"] in fac_val_dates.get(fn, set()):
-                    continue
-                # Saturday strictly only for TA/RA — never relaxed regardless of level
-                if sl["date"].weekday() == 5 and desig_ not in SAT_DESIG:
-                    continue
-                if desig_ == "ACP":
-                    lim_on  = acp_online_limit.get(fn, 1)
-                    lim_off = acp_offline_limit.get(fn, 1)
-                    if sl["type"] == "Online"  and acp_tc[fn]["Online"]  >= lim_on:  continue
-                    if sl["type"] == "Offline" and acp_tc[fn]["Offline"] >= lim_off: continue
-                if relax < 1 and sl["date"] in cur_dates[fn]:
-                    continue
-                # Relax 4: ignore max duty limit (force-fill critical unmet slots)
-                if relax < 4 and cur_alloc[fn] >= DESIG_RULES[desig_][1]:
-                    continue
-                cands.append((fn, fexp[fn].get(key, 0)))
-
-            cands.sort(key=lambda z: (
-                -DESIG_PRIORITY.get(fac_d[z[0]], 0),
-                -z[1],
-                cur_alloc[z[0]]
-            ))
-
-            for fn, sc in cands:
-                if needed <= 0:
-                    break
-                cur_alloc[fn] += 1
-                cur_dates[fn].add(sl["date"])
-                if fac_d.get(fn) == "ACP":
-                    acp_tc[fn][sl["type"]] += 1
-                slot_filled[key] += 1
-                needed -= 1
-                lbl = "Gap-Fill" if relax == 0 else f"Gap-Fill-R{relax+1}"
-                assigned.append({"Name": fn, "Date": sl["date"],
-                                 "Session": sl["session"], "Type": sl["type"],
-                                 "Allocated_By": lbl})
-
-        if needed > 0:
-            log(f"  ⚠ Unfillable: {needed} seat(s) at "
-                f"{sl['date']} {sl['session']} {sl['type']} "
-                f"(insufficient eligible faculty)")
-
-    gaps_after = sum(
-        max(0, sl["required"] - slot_filled.get((sl["date"], sl["session"], sl["type"]), 0))
-        for sl in ALL_S)
-    log(f"  Gaps after completion: {gaps_after}  "
-        f"{'✓ All slots filled!' if gaps_after == 0 else '⚠ Some seats unfilled'}")
-
-    # ── Build output dataframes ───────────────────────────────────
-    if not assigned:
-        raise RuntimeError("No assignments produced. Check input files.")
-
+def _build_summary(assigned, core):
+    ALL_FAC = core["ALL_FAC"]; fac_d = core["fac_d"]
+    ALL_S   = core["ALL_S"];   submitted = core["submitted"]
+    sub_counts = core["sub_counts"]
     alloc = pd.DataFrame(assigned)
     alloc["Date"] = pd.to_datetime(alloc["Date"]).dt.strftime("%d-%m-%Y")
-    alloc = alloc.sort_values(["Date", "Session", "Name"]).reset_index(drop=True)
+    alloc = alloc.sort_values(["Date","Session","Name"]).reset_index(drop=True)
     alloc.insert(0, "Sl.No", alloc.index + 1)
 
     sumrows = []
     for fn in ALL_FAC:
-        d2  = fac_d[fn]; dr = DESIG_RULES[d2]
-        rf  = alloc[alloc["Name"] == fn]; ab = rf["Allocated_By"]
-        tot = len(rf)
-        wt  = int(ab.isin(WILL_TAGS).sum())
+        d2 = fac_d[fn]; dr = DESIG_RULES[d2]
+        rf = alloc[alloc["Name"] == fn]; ab = rf["Allocated_By"]
+        tot = len(rf); wt = int(ab.isin(WILL_TAGS).sum())
         sumrows.append({
             "Name": fn, "Designation": d2,
-            "Submitted":          "Yes" if fn in submitted else "No",
-            "Submitted_Count":    sub_counts.get(fn, 0),
-            "Required_Duties":    dr[0],
-            "Submission_Shortfall": max(0, dr[0] - sub_counts.get(fn, 0)),
-            "Assigned_Duties":    tot,
-            "Willingness_Total": wt,
+            "Submitted":        "Yes" if fn in submitted else "No",
+            "Submitted_Count":  sub_counts.get(fn, 0),
+            "Required_Duties":  dr[0], "Assigned_Duties": tot,
+            "Willingness_Total":wt,
             "Match_%":          f"{wt/tot*100:.0f}%" if tot else "N/A",
-            "Exact_Match":      int((ab == "Willingness-Exact").sum()),
-            "ACP_Online":       int((ab == "Willingness-ACPOnline").sum()),
-            "Session_Flip":     int((ab == "Willingness-SessionFlip").sum()),
-            "Adj_±1Day":        int((ab == "Willingness-±1Day").sum()),
-            "Val_Adj":          int((ab == "Willingness-ValAdj").sum()),
-            "Auto_Assigned":    int(ab.isin(["Auto-Assigned","OR-Assigned",
-                                             "Gap-Fill","Gap-Fill-R2",
-                                             "Gap-Fill-R3","Gap-Fill-R4",
-                                             "Gap-Fill-R5"]).sum()),
-            "Online":           int((rf["Type"] == "Online").sum()),
-            "Offline":          int((rf["Type"] == "Offline").sum()),
-            "Gap":              max(dr[0] - tot, 0),
+            "Exact_Match":      int((ab=="Willingness-Exact").sum()),
+            "ACP_Online":       int((ab=="Willingness-ACPOnline").sum()),
+            "Session_Flip":     int((ab=="Willingness-SessionFlip").sum()),
+            "Adj_±1Day":        int((ab=="Willingness-±1Day").sum()),
+            "Adj_±2Day":        int((ab=="Willingness-±2Day").sum()),
+            "Val_Adj":          int((ab=="Willingness-ValAdj").sum()),
+            "SAP_Online":       int((ab=="SAP-OnlineFallback").sum()),
+            "Auto_Assigned":    int(ab.isin(["Auto-Assigned","OR-Assigned","Gap-Fill"]).sum()),
+            "Online":  int((rf["Type"]=="Online").sum()),
+            "Offline": int((rf["Type"]=="Offline").sum()),
+            "Gap":     max(dr[0]-tot, 0),
         })
     sumdf = pd.DataFrame(sumrows)
 
     slotrows = []
     for sl in ALL_S:
-        ds  = pd.Timestamp(sl["date"]).strftime("%d-%m-%Y")
-        na  = len(alloc[(alloc["Date"] == ds) &
-                        (alloc["Session"] == sl["session"]) &
-                        (alloc["Type"]    == sl["type"])])
+        ds = pd.Timestamp(sl["date"]).strftime("%d-%m-%Y")
+        na = len(alloc[(alloc["Date"]==ds)&(alloc["Session"]==sl["session"])&(alloc["Type"]==sl["type"])])
         slotrows.append({
             "Date": ds, "Session": sl["session"], "Type": sl["type"],
             "Required": sl["required"], "Assigned": na,
@@ -1246,123 +1172,549 @@ def run_optimizer(log_box):
 
     desigrows = []
     for d2 in DESIG_RULES:
-        sub2 = sumdf[sumdf["Designation"] == d2]
+        sub2 = sumdf[sumdf["Designation"]==d2]
         if sub2.empty: continue
-        on   = int(sub2["Online"].sum())
-        of   = int(sub2["Offline"].sum())
-        dr   = DESIG_RULES[d2]
+        dr = DESIG_RULES[d2]
+        on = int(sub2["Online"].sum()); of = int(sub2["Offline"].sum())
         desigrows.append({
             "Designation": d2, "Faculty_Count": len(sub2),
-            "Duties_Per_Person": dr[0],
-            "Total_Required":   dr[0] * len(sub2),
-            "Total_Assigned":   on + of,
+            "Duties_Per_Person": dr[0], "Total_Required": dr[0]*len(sub2),
+            "Total_Assigned": on+of,
             "Willingness_Matched": int(sub2["Willingness_Total"].sum()),
-            "Auto_Assigned":    int(sub2["Auto_Assigned"].sum()),
-            "Online": on, "Offline": of
+            "Auto_Assigned": int(sub2["Auto_Assigned"].sum()),
+            "Online": on, "Offline": of,
         })
     desigdf = pd.DataFrame(desigrows)
-
-    # ── Save to Excel ─────────────────────────────────────────────
-    alloc.to_excel(FINAL_ALLOC_FILE, index=False)
-    with pd.ExcelWriter(ALLOC_REPORT_FILE, engine="openpyxl") as writer:
-        desigdf.to_excel(writer, sheet_name="Designation_Summary", index=False)
-        sumdf.to_excel(writer,   sheet_name="Faculty_Summary",     index=False)
-        slotdf.to_excel(writer,  sheet_name="Slot_Verification",   index=False)
-        alloc.to_excel(writer,   sheet_name="Full_Allocation",     index=False)
-
-    # ── Summary log ───────────────────────────────────────────────
-    tot  = len(alloc); ab2 = alloc["Allocated_By"]
-    unmet = slotdf[~slotdf["Status"].str.startswith("✓")]
-    gaps  = sumdf[sumdf["Gap"] > 0]
-
-    sub_alloc      = alloc[alloc["Name"].isin(submitted)]
-    will_matched   = int(sub_alloc["Allocated_By"].isin(WILL_TAGS).sum()) if not sub_alloc.empty else 0
-    will_total_sub = len(sub_alloc)
-    overall_match_pct = (will_matched / will_total_sub * 100) if will_total_sub > 0 else 0
-
-    sub_sumdf  = sumdf[sumdf["Submitted"] == "Yes"].copy()
-    sub_sumdf["_pct"] = sub_sumdf.apply(
-        lambda r: r["Willingness_Total"] / r["Assigned_Duties"] * 100
-        if r["Assigned_Duties"] > 0 else 0, axis=1)
-    above80 = int((sub_sumdf["_pct"] >= 80).sum())
-
-    log(f"\n{'='*62}\n  RESULTS\n{'='*62}")
-    log(f"  Total assignments          : {tot}")
-    log(f"  ├─ Exact willingness       : {int((ab2 == 'Willingness-Exact').sum())}")
-    log(f"  ├─ ACP offline→online      : {int((ab2 == 'Willingness-ACPOnline').sum())}")
-    log(f"  ├─ Session flip FN↔AN      : {int((ab2 == 'Willingness-SessionFlip').sum())}")
-    log(f"  ├─ Adjacent ±1 biz-day     : {int((ab2 == 'Willingness-±1Day').sum())}")
-    log(f"  ├─ Valuation-adj           : {int((ab2 == 'Willingness-ValAdj').sum())}")
-    log(f"  └─ Auto / Gap-Fill         : {int(ab2.isin(['Auto-Assigned','OR-Assigned','Gap-Fill','Gap-Fill-R2','Gap-Fill-R3','Gap-Fill-R4']).sum())}")
-    log(f"\n  ★ Overall willingness match: {overall_match_pct:.1f}%  ({will_matched}/{will_total_sub})")
-    log(f"  ★ Faculty ≥80% match       : {above80}/{len(sub_sumdf)}")
-
-    log(f"\n  Designation-wise breakdown:")
-    for dg in ["P", "ACP", "SAP", "AP3", "AP2", "TA", "RA"]:
-        sub2 = sumdf[sumdf["Designation"] == dg]
-        if sub2.empty: continue
-        prio_lbl = "⭐ priority" if DESIG_PRIORITY.get(dg, 0) > 0 else "  fill-in"
-        avg_m = sub2.apply(
-            lambda r: r["Willingness_Total"] / r["Assigned_Duties"] * 100
-            if r["Assigned_Duties"] > 0 else 0, axis=1).mean()
-        log(f"  {dg:4} [{prio_lbl}]: {len(sub2):3} faculty | "
-            f"avg match {avg_m:.0f}% | auto {int(sub2['Auto_Assigned'].sum())}")
-
-    if not unmet.empty:
-        log(f"\n  ⚠ Unfilled slots ({len(unmet)}):")
-        for _, r in unmet.iterrows():
-            log(f"    {r['Date']} {r['Session']} {r['Type']} — {r['Status']}")
-    else:
-        log(f"\n  ✓ All {len(slotdf)} slots fully filled")
-
-    if not gaps.empty:
-        log(f"  ⚠ Faculty under-assigned ({len(gaps)}):")
-        for _, r in gaps.iterrows():
-            log(f"    {r['Name']} ({r['Designation']}) — {r['Gap']} duty gap")
-    else:
-        log(f"  ✓ All faculty assigned correct duty count")
-
-    if non_sub:
-        log(f"\n  ⚠ No-submission faculty ({len(non_sub)}) — auto-assigned:")
-        for n in non_sub:
-            log(f"      {n}  ({fac_d.get(n,'?')})")
-    if under_sub:
-        log(f"\n  ⚠ Under-submitted faculty ({len(under_sub)}):")
-        for n, given, req in under_sub:
-            rf2   = alloc[alloc["Name"] == n]
-            exact = int(rf2["Allocated_By"].isin(WILL_TAGS).sum())
-            log(f"      {n}  ({fac_d.get(n,'?')})  submitted {given}/{req}  →  {exact} matched")
-
-    # ── Match failure analysis ────────────────────────────────────
-    log(f"\n  ── Why Match Rate Is Low ────────────────────────────")
-    if not wdf.empty:
-        slot_date_set2 = {s["date"] for s in ALL_S}
-        will_dates2    = set(wdf["Date"].dt.date.dropna())
-        overlap2       = will_dates2 & slot_date_set2
-        only_will2     = will_dates2 - slot_date_set2
-        if len(overlap2) == 0:
-            log("  ✗ CRITICAL: Zero date overlap between willingness and slots.")
-            log("    Faculty submitted dates that are NOT exam days.")
-            log("    Fix: Re-collect willingness using the portal calendar.")
-        elif len(only_will2) > len(overlap2):
-            log(f"  ⚠ {len(only_will2)} willingness dates fall outside slot dates.")
-            log(f"    Only {len(overlap2)} willingness dates coincide with actual exam days.")
-            log("    Fix: Ask faculty to re-submit using the portal calendar.")
-        else:
-            log(f"  ✓ Date overlap exists ({len(overlap2)} dates).")
-            log("    Low match likely due to seat contention — many faculty chose same dates.")
-            log("    Encourage faculty to spread willingness across different dates.")
-    log(f"  Tip: Match rate improves when faculty submit MORE dates spread across the exam period.")
-
     return alloc, sumdf, slotdf, desigdf
 
 
+def _greedy_solve(core, log):
+    ALL_FAC = core["ALL_FAC"]; fac_d = core["fac_d"]
+    ALL_S   = core["ALL_S"];   fexp  = core["fexp"]
+    tag     = core["tag"];     is_eligible = core["is_eligible"]
+    non_sub = core["non_sub"]; SAT_DESIG = core["SAT_DESIG"]
+    sap_fallback = core["sap_fallback"]
+    acp_2online  = core["acp_2online"]
+    acp_2offline = core["acp_2offline"]
+
+    alloc_count  = defaultdict(int)
+    used_dt_sess = defaultdict(set)
+    acp_online   = defaultdict(int)
+    acp_offline  = defaultdict(int)
+
+    def rem(fn):
+        return DESIG_RULES[fac_d[fn]][1] - alloc_count[fn]
+
+    def eligible(fn, sl):
+        if not is_eligible(fn, sl):        return False
+        if rem(fn) <= 0:                   return False
+        if (sl["date"], sl["session"]) in used_dt_sess[fn]: return False
+        d2 = fac_d[fn]
+        if d2 == "ACP":
+            if sl["type"] == "Online":
+                limit_on = 2 if fn in acp_2online else 1
+                if acp_online[fn] >= limit_on: return False
+            if sl["type"] == "Offline":
+                limit_off = 2 if fn in acp_2offline else 1
+                if acp_offline[fn] >= limit_off: return False
+        if fn in sap_fallback and sl["type"] == "Online" and alloc_count[fn] >= DESIG_RULES[d2][0]:
+            return False
+        return True
+
+    def score(fn, sl):
+        k  = (sl["date"], sl["session"], sl["type"])
+        sc = fexp[fn].get(k, 0)
+        return (sc, -alloc_count[fn], -DESIG_PRIORITY.get(fac_d[fn], 0))
+
+    assigned = []
+    for sl in sorted(ALL_S, key=lambda s: (s["type"]!="Online", -s["required"])):
+        needed = sl["required"]
+        cands  = sorted([fn for fn in ALL_FAC if eligible(fn, sl)],
+                        key=lambda fn: score(fn, sl), reverse=True)
+        for fn in cands[:needed]:
+            k  = (sl["date"], sl["session"], sl["type"])
+            sc = fexp[fn].get(k, 0)
+            assigned.append({"Name": fn, "Date": sl["date"],
+                             "Session": sl["session"], "Type": sl["type"],
+                             "Allocated_By": tag(fn, k, sc)})
+            alloc_count[fn] += 1
+            used_dt_sess[fn].add((sl["date"], sl["session"]))
+            if fac_d[fn] == "ACP":
+                if sl["type"] == "Online":  acp_online[fn]  += 1
+                if sl["type"] == "Offline": acp_offline[fn] += 1
+
+        filled = sum(1 for a in assigned
+                     if a["Date"]==sl["date"] and a["Session"]==sl["session"] and a["Type"]==sl["type"])
+        if filled < needed:
+            extras = sorted(
+                [fn for fn in ALL_FAC
+                 if is_eligible(fn, sl) and (sl["date"],sl["session"]) not in used_dt_sess[fn]
+                 and fn not in [a["Name"] for a in assigned
+                                if a["Date"]==sl["date"] and a["Session"]==sl["session"] and a["Type"]==sl["type"]]],
+                key=lambda fn: score(fn, sl), reverse=True)
+            for fn in extras[:needed-filled]:
+                k  = (sl["date"], sl["session"], sl["type"])
+                sc = fexp[fn].get(k, 0)
+                assigned.append({"Name": fn, "Date": sl["date"],
+                                 "Session": sl["session"], "Type": sl["type"],
+                                 "Allocated_By": tag(fn, k, sc)})
+                alloc_count[fn] += 1
+                used_dt_sess[fn].add((sl["date"], sl["session"]))
+
+    for fn in ALL_FAC:
+        needed = DESIG_RULES[fac_d[fn]][0] - alloc_count[fn]
+        if needed <= 0: continue
+        for sl in sorted(ALL_S, key=lambda s: fexp[fn].get(
+                (s["date"],s["session"],s["type"]),0), reverse=True):
+            if needed <= 0: break
+            if not is_eligible(fn, sl): continue
+            if (sl["date"],sl["session"]) in used_dt_sess[fn]: continue
+            k  = (sl["date"], sl["session"], sl["type"])
+            sc = fexp[fn].get(k, 0)
+            assigned.append({"Name": fn, "Date": sl["date"],
+                             "Session": sl["session"], "Type": sl["type"],
+                             "Allocated_By": tag(fn, k, sc)})
+            alloc_count[fn] += 1
+            used_dt_sess[fn].add((sl["date"],sl["session"]))
+            needed -= 1
+
+    return assigned
+
+
+def _cpsat_solve(core, log):
+    if not ORTOOLS_OK:
+        log("  CP-SAT not available.")
+        return None
+
+    ALL_FAC = core["ALL_FAC"]; FAC_IDX = core["FAC_IDX"]
+    N_FAC   = core["N_FAC"];   fac_d   = core["fac_d"]
+    ALL_S   = core["ALL_S"];   NS      = core["NS"]
+    fexp    = core["fexp"];    tag     = core["tag"]
+    submitted  = core["submitted"]; non_sub = core["non_sub"]
+    is_eligible = core["is_eligible"]
+    dt_sess = defaultdict(list)
+    for si, sl in enumerate(ALL_S):
+        dt_sess[(sl["date"], sl["session"])].append(si)
+
+    SLACK_PENALTY = 10_000_000
+    GAP_PENALTY   =    500_000
+
+    try:
+        mdl = cp_model.CpModel()
+        x = {}
+        for fi, fn in enumerate(ALL_FAC):
+            for si, sl in enumerate(ALL_S):
+                x[(fi, si)] = mdl.NewBoolVar(f"x_{fi}_{si}")
+                if not is_eligible(fn, sl):
+                    mdl.Add(x[(fi, si)] == 0)
+
+        sv = {}
+        for si, sl in enumerate(ALL_S):
+            sv[si] = mdl.NewIntVar(0, sl["required"], f"sv_{si}")
+
+        gv = {}
+        for fi, fn in enumerate(ALL_FAC):
+            dr = DESIG_RULES[fac_d[fn]]
+            gv[fi] = mdl.NewIntVar(0, dr[0], f"gv_{fi}")
+
+        obj_terms = []
+        for fi, fn in enumerate(ALL_FAC):
+            for si, sl in enumerate(ALL_S):
+                if not is_eligible(fn, sl): continue
+                k  = (sl["date"], sl["session"], sl["type"])
+                sc = fexp[fn].get(k, 0)
+                if sc > 0:
+                    obj_terms.append(sc * x[(fi, si)])
+                elif fn in submitted:
+                    obj_terms.append(-PENALTY * x[(fi, si)])
+        for si in range(NS):
+            obj_terms.append(-SLACK_PENALTY * sv[si])
+        for fi in range(N_FAC):
+            obj_terms.append(-GAP_PENALTY * gv[fi])
+        mdl.Maximize(sum(obj_terms))
+
+        for si, sl in enumerate(ALL_S):
+            mdl.Add(sum(x[(f, si)] for f in range(N_FAC)) + sv[si] == sl["required"])
+        for fi, fn in enumerate(ALL_FAC):
+            dr = DESIG_RULES[fac_d[fn]]
+            mdl.Add(sum(x[(fi, s)] for s in range(NS)) <= dr[1])
+            mdl.Add(sum(x[(fi, s)] for s in range(NS)) + gv[fi] == dr[0])
+        for fi in range(N_FAC):
+            for sil in dt_sess.values():
+                if len(sil) > 1:
+                    mdl.Add(sum(x[(fi, si)] for si in sil) <= 1)
+
+        acp_2online  = core["acp_2online"]
+        acp_2offline = core["acp_2offline"]
+        on_i  = [i for i, s in enumerate(ALL_S) if s["type"] == "Online"]
+        off_i = [i for i, s in enumerate(ALL_S) if s["type"] == "Offline"]
+        for fn in ALL_FAC:
+            if fac_d[fn] != "ACP": continue
+            fi = FAC_IDX[fn]
+            max_on  = 2 if fn in acp_2online  else 1
+            max_off = 2 if fn in acp_2offline else 1
+            if on_i:  mdl.Add(sum(x[(fi, si)] for si in on_i)  <= max_on)
+            if off_i: mdl.Add(sum(x[(fi, si)] for si in off_i) <= max_off)
+
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds  = 300
+        solver.parameters.num_search_workers   = 4
+        solver.parameters.log_search_progress  = False
+
+        status = solver.Solve(mdl)
+        log(f"  CP-SAT status : {solver.StatusName(status)}")
+        log(f"  Wall time     : {solver.WallTime():.1f}s")
+
+        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            log("  ⚠ CP-SAT could not find a solution — skipping Method C")
+            return None
+
+        assigned = []
+        for fi, fn in enumerate(ALL_FAC):
+            for si, sl in enumerate(ALL_S):
+                if solver.Value(x[(fi, si)]) == 1:
+                    k  = (sl["date"], sl["session"], sl["type"])
+                    sc = fexp[fn].get(k, 0)
+                    assigned.append({"Name": fn, "Date": sl["date"],
+                                     "Session": sl["session"], "Type": sl["type"],
+                                     "Allocated_By": tag(fn, k, sc)})
+
+        slack_total = sum(solver.Value(sv[si]) for si in range(NS))
+        gap_total   = sum(solver.Value(gv[fi]) for fi in range(N_FAC))
+        if slack_total > 0:
+            log(f"  ⚠ Unfilled seats : {slack_total}")
+            for si, sl in enumerate(ALL_S):
+                sk = solver.Value(sv[si])
+                if sk > 0:
+                    log(f"    {sl['date'].strftime('%d-%m-%Y')} {sl['session']} {sl['type']} short {sk}")
+        else:
+            log("  ✓ All slots fully filled")
+        if gap_total > 0:
+            log(f"  ⚠ Faculty gaps   : {gap_total}")
+        else:
+            log("  ✓ All faculty assigned correct duty count")
+        return assigned
+
+    except Exception as e:
+        log(f"  ✗ CP-SAT error: {e}")
+        return None
+
+
+def _milp_solve(core, log):
+    ALL_FAC = core["ALL_FAC"]; FAC_IDX = core["FAC_IDX"]
+    N_FAC   = core["N_FAC"];   fac_d   = core["fac_d"]
+    ALL_S   = core["ALL_S"];   NS      = core["NS"]
+    fexp    = core["fexp"];    tag     = core["tag"]
+    submitted = core["submitted"]; non_sub = core["non_sub"]
+    is_eligible = core["is_eligible"]
+    sap_fallback = core["sap_fallback"]
+
+    SLACK_PENALTY = 10_000_000
+    GAP_PENALTY   =    500_000
+
+    def v(fi, si): return fi * NS + si
+    def sv(si):    return N_FAC * NS + si
+    def gv(fi):    return N_FAC * NS + NS + fi
+
+    NV    = N_FAC * NS + NS + N_FAC
+    c_obj = np.zeros(NV)
+    lb    = np.zeros(NV)
+    ub    = np.ones(NV)
+
+    for fi, fn in enumerate(ALL_FAC):
+        for si, sl in enumerate(ALL_S):
+            if not is_eligible(fn, sl):
+                ub[v(fi, si)] = 0.0; continue
+            k  = (sl["date"], sl["session"], sl["type"])
+            sc = fexp[fn].get(k, 0)
+            if sc > 0:
+                c_obj[v(fi, si)] = -float(sc)
+            elif fn in submitted:
+                c_obj[v(fi, si)] = float(PENALTY)
+
+    for si, sl in enumerate(ALL_S):
+        ub[sv(si)]    = float(sl["required"])
+        c_obj[sv(si)] = float(SLACK_PENALTY)
+
+    for fi, fn in enumerate(ALL_FAC):
+        dr = DESIG_RULES[fac_d[fn]]
+        ub[gv(fi)]    = float(dr[0])
+        c_obj[gv(fi)] = float(GAP_PENALTY)
+
+    rA, cA, dA, blo, bhi = [], [], [], [], []
+    nc = [0]
+    def add_con(vids, coeffs, lo, hi):
+        for vi, co in zip(vids, coeffs):
+            rA.append(nc[0]); cA.append(vi); dA.append(float(co))
+        blo.append(float(lo)); bhi.append(float(hi)); nc[0] += 1
+
+    for si, sl in enumerate(ALL_S):
+        add_con([v(f,si) for f in range(N_FAC)] + [sv(si)],
+                [1]*N_FAC + [1], sl["required"], sl["required"])
+
+    for fi, fn in enumerate(ALL_FAC):
+        dr = DESIG_RULES[fac_d[fn]]
+        add_con([v(fi,s) for s in range(NS)], [1]*NS, 0, dr[1])
+        add_con([v(fi,s) for s in range(NS)] + [gv(fi)],
+                [1]*NS + [1], dr[0], dr[0])
+
+    dt_sess = defaultdict(list)
+    for si, sl in enumerate(ALL_S):
+        dt_sess[(sl["date"], sl["session"])].append(si)
+    for fi in range(N_FAC):
+        for sil in dt_sess.values():
+            if len(sil) > 1:
+                add_con([v(fi,si) for si in sil], [1]*len(sil), 0, 1)
+
+    acp_2online  = core["acp_2online"]
+    acp_2offline = core["acp_2offline"]
+    on_i  = [i for i, s in enumerate(ALL_S) if s["type"] == "Online"]
+    off_i = [i for i, s in enumerate(ALL_S) if s["type"] == "Offline"]
+    for fn in ALL_FAC:
+        if fac_d[fn] != "ACP": continue
+        fi = FAC_IDX[fn]
+        max_on  = 2 if fn in acp_2online  else 1
+        max_off = 2 if fn in acp_2offline else 1
+        if on_i:
+            add_con([v(fi,si) for si in on_i],  [1]*len(on_i),  0, max_on)
+        if off_i:
+            add_con([v(fi,si) for si in off_i], [1]*len(off_i), 0, max_off)
+
+    from scipy.sparse import csc_matrix
+    A = csc_matrix((dA, (rA, cA)), shape=(nc[0], NV))
+    log(f"  Variables    : {NV}  Constraints: {nc[0]}")
+
+    res = milp(
+        c=c_obj,
+        constraints=LinearConstraint(A, blo, bhi),
+        integrality=np.ones(NV),
+        bounds=Bounds(lb=lb, ub=ub),
+        options={"disp": False, "time_limit": 300}
+    )
+    log(f"  HiGHS status : {res.message}")
+
+    if res.status not in (0, 1):
+        log("  ⚠ MILP failed — using greedy fallback")
+        return _greedy_solve(core, log)
+
+    xh = np.round(res.x).astype(int)
+    assigned = []
+    for fi, fn in enumerate(ALL_FAC):
+        for si, sl in enumerate(ALL_S):
+            if xh[v(fi, si)] == 1:
+                k  = (sl["date"], sl["session"], sl["type"])
+                sc = fexp[fn].get(k, 0)
+                assigned.append({"Name": fn, "Date": sl["date"],
+                                 "Session": sl["session"], "Type": sl["type"],
+                                 "Allocated_By": tag(fn, k, sc)})
+
+    slack_slots = [(si, sl) for si, sl in enumerate(ALL_S) if xh[sv(si)] > 0]
+    gap_fac     = [(fi, fn) for fi, fn in enumerate(ALL_FAC) if xh[gv(fi)] > 0]
+    if slack_slots:
+        log(f"  ⚠ Unfilled seats: {sum(xh[sv(si)] for si,_ in slack_slots)}")
+        for si, sl in slack_slots:
+            log(f"    {sl['date'].strftime('%d-%m-%Y')} {sl['session']} {sl['type']} short {xh[sv(si)]}")
+    else:
+        log("  ✓ All slots fully filled")
+    if gap_fac:
+        log(f"  ⚠ Faculty duty gaps: {sum(xh[gv(fi)] for fi,_ in gap_fac)}")
+        for fi, fn in gap_fac:
+            log(f"    {fn} — short {xh[gv(fi)]}")
+    else:
+        log("  ✓ All faculty assigned correct duty count")
+
+    return assigned
+
+
+def _log_result(assigned, core, method, log):
+    ALL_FAC   = core["ALL_FAC"]; fac_d    = core["fac_d"]
+    submitted = core["submitted"]; non_sub = core["non_sub"]
+    ALL_S     = core["ALL_S"];   sub_counts = core["sub_counts"]
+    sap_fallback = core["sap_fallback"]
+
+    alloc, sumdf, slotdf, desigdf = _build_summary(assigned, core)
+    tot = len(alloc); ab2 = alloc["Allocated_By"]
+    unmet = slotdf[~slotdf["Status"].str.startswith("✓")]
+    gaps  = sumdf[sumdf["Gap"] > 0]
+    sub_alloc = alloc[alloc["Name"].isin(submitted)]
+    will_matched = int(sub_alloc["Allocated_By"].isin(WILL_TAGS).sum()) if not sub_alloc.empty else 0
+    will_total   = len(sub_alloc)
+    overall_pct  = will_matched / will_total * 100 if will_total > 0 else 0
+
+    log(f"\n  {'='*54}")
+    log(f"  RESULT  [{method}]")
+    log(f"  {'='*54}")
+    log(f"  Total assignments   : {tot}")
+    log(f"  ├─ Exact            : {int((ab2=='Willingness-Exact').sum())}")
+    log(f"  ├─ ACP Online       : {int((ab2=='Willingness-ACPOnline').sum())}")
+    log(f"  ├─ Session flip     : {int((ab2=='Willingness-SessionFlip').sum())}")
+    log(f"  ├─ ±1 day           : {int((ab2=='Willingness-±1Day').sum())}")
+    log(f"  ├─ ±2 days          : {int((ab2=='Willingness-±2Day').sum())}")
+    log(f"  ├─ Val-adjacent     : {int((ab2=='Willingness-ValAdj').sum())}")
+    log(f"  ├─ SAP online       : {int((ab2=='SAP-OnlineFallback').sum())}")
+    log(f"  └─ Auto/OR-assigned : {int(ab2.isin(['Auto-Assigned','OR-Assigned','Gap-Fill']).sum())}")
+    log(f"\n  ★ Willingness match : {overall_pct:.1f}%  ({will_matched}/{will_total})")
+    log(f"  Slots filled        : {len(slotdf)-len(unmet)}/{len(slotdf)}"
+        + (" ✓" if len(unmet)==0 else f"  ⚠ {len(unmet)} unmet"))
+    log(f"  Faculty targets     : {len(sumdf)-len(gaps)}/{len(sumdf)}"
+        + (" ✓" if len(gaps)==0 else f"  ⚠ {len(gaps)} short"))
+
+    acp = sumdf[sumdf["Designation"]=="ACP"]
+    p   = sumdf[sumdf["Designation"]=="P"]
+    acp_2online  = core["acp_2online"]
+    acp_2offline = core["acp_2offline"]
+    p_ok = len(p[p["Online"]==1])
+    log(f"  P   (1 online)      : {p_ok}/{len(p)}")
+    log(f"  ACP summary:")
+    for _, r in acp.iterrows():
+        on_c  = int(r["Online"]); off_c = int(r["Offline"])
+        pattern = f"{on_c} online + {off_c} offline"
+        if r["Name"] in acp_2online:   note = "  [first-2: up to 2 online]"
+        elif r["Name"] in acp_2offline: note = "  [last-2: up to 2 offline]"
+        else:                           note = "  [standard: 1+1]"
+        flag = "" if on_c >= 1 else "  !! NO ONLINE !!"
+        log(f"    {r['Name']:<32} {pattern}{note}{flag}")
+    if sap_fallback:
+        sap_on = sumdf[sumdf["Name"].isin(sap_fallback)][["Name","Online","Offline"]]
+        for _, r in sap_on.iterrows():
+            if r["Online"] > 0:
+                log(f"  SAP fallback used   : {r['Name']} -> {int(r['Online'])} online")
+
+    return alloc, sumdf, slotdf, desigdf, overall_pct, len(unmet), len(gaps)
+
+
+def run_optimizer(log_box):
+    log_lines = []
+    def log(m=""):
+        log_lines.append(m)
+        log_box.code("\n".join(log_lines), language="text")
+
+    log("=" * 62)
+    log("  SASTRA SoME Duty Optimizer  v4")
+    log(f"  Method A: scipy HiGHS MILP")
+    log(f"  Method B: Smart Greedy")
+    log(f"  Method C: OR-Tools CP-SAT  ({'✅ Available' if ORTOOLS_OK else '❌ Not available'})")
+    log("=" * 62)
+
+    log("\n  Loading data...")
+    core = _load_core(log)
+    results = {}
+
+    log("\n" + "─"*62)
+    log("  METHOD A — scipy HiGHS MILP")
+    log("─"*62)
+    try:
+        assigned_A = _milp_solve(core, log)
+        alloc_A, sumdf_A, slotdf_A, desigdf_A, pct_A, unmet_A, gaps_A = \
+            _log_result(assigned_A, core, "MILP", log)
+        results["MILP"] = dict(alloc=alloc_A, sumdf=sumdf_A, slotdf=slotdf_A,
+                               desigdf=desigdf_A, pct=pct_A, unmet=unmet_A, gaps=gaps_A)
+    except Exception as e:
+        log(f"  ✗ MILP error: {e} — using greedy fallback")
+        assigned_A = _greedy_solve(core, log)
+        alloc_A, sumdf_A, slotdf_A, desigdf_A, pct_A, unmet_A, gaps_A = \
+            _log_result(assigned_A, core, "MILP→Greedy", log)
+        results["MILP"] = dict(alloc=alloc_A, sumdf=sumdf_A, slotdf=slotdf_A,
+                               desigdf=desigdf_A, pct=pct_A, unmet=unmet_A, gaps=gaps_A)
+
+    log("\n" + "─"*62)
+    log("  METHOD B — Smart Greedy")
+    log("─"*62)
+    try:
+        assigned_B = _greedy_solve(core, log)
+        alloc_B, sumdf_B, slotdf_B, desigdf_B, pct_B, unmet_B, gaps_B = \
+            _log_result(assigned_B, core, "Greedy", log)
+        results["Greedy"] = dict(alloc=alloc_B, sumdf=sumdf_B, slotdf=slotdf_B,
+                                 desigdf=desigdf_B, pct=pct_B, unmet=unmet_B, gaps=gaps_B)
+    except Exception as e:
+        log(f"  ✗ Greedy error: {e}")
+        results["Greedy"] = results["MILP"]
+        pct_B, unmet_B, gaps_B = pct_A, unmet_A, gaps_A
+        alloc_B, sumdf_B, slotdf_B = alloc_A, sumdf_A, slotdf_A
+
+    pct_C = unmet_C = gaps_C = None
+    alloc_C = sumdf_C = slotdf_C = desigdf_C = None
+    if ORTOOLS_OK:
+        log("\n" + "─"*62)
+        log("  METHOD C — OR-Tools CP-SAT")
+        log("─"*62)
+        try:
+            assigned_C = _cpsat_solve(core, log)
+            if assigned_C is not None:
+                alloc_C, sumdf_C, slotdf_C, desigdf_C, pct_C, unmet_C, gaps_C = \
+                    _log_result(assigned_C, core, "CP-SAT", log)
+                results["CP-SAT"] = dict(alloc=alloc_C, sumdf=sumdf_C, slotdf=slotdf_C,
+                                         desigdf=desigdf_C, pct=pct_C, unmet=unmet_C, gaps=gaps_C)
+        except Exception as e:
+            log(f"  ✗ CP-SAT error: {e}")
+    else:
+        log("\n  METHOD C — OR-Tools CP-SAT  ❌ Skipped (not installed)")
+
+    log("\n" + "═"*62)
+    log("  COMPARISON SUMMARY")
+    log("═"*62)
+    hdr = f"  {'Metric':<30} {'MILP':>10} {'Greedy':>10}"
+    if pct_C is not None: hdr += f" {'CP-SAT':>10}"
+    log(hdr); log("  " + "─"*58)
+    def _row(label, vA, vB, vC, fmt="{}"):
+        fA = fmt.format(vA) if vA is not None else "—"
+        fB = fmt.format(vB) if vB is not None else "—"
+        line = f"  {label:<30} {fA:>10} {fB:>10}"
+        if pct_C is not None: line += f" {(fmt.format(vC) if vC is not None else '—'):>10}"
+        log(line)
+    _row("Willingness match %", pct_A, pct_B, pct_C, fmt="{:.1f}%")
+    _row("Unmet slots",         unmet_A, unmet_B, unmet_C)
+    _row("Faculty duty gaps",   gaps_A,  gaps_B,  gaps_C)
+    _row("Total assignments",   len(alloc_A), len(alloc_B),
+         len(alloc_C) if alloc_C is not None else None)
+    log("  " + "─"*58)
+
+    candidates = [("MILP", pct_A, unmet_A, gaps_A), ("Greedy", pct_B, unmet_B, gaps_B)]
+    if pct_C is not None: candidates.append(("CP-SAT", pct_C, unmet_C, gaps_C))
+    candidates.sort(key=lambda x: (x[2], x[3], -x[1]))
+    rec = candidates[0][0]
+    method_letter = {"MILP":"A","Greedy":"B","CP-SAT":"C"}[rec]
+    log(f"  ★ Recommendation : METHOD {method_letter} ({rec})")
+
+    alloc_A.to_excel("Final_Allocation_MILP.xlsx",   index=False)
+    alloc_B.to_excel("Final_Allocation_Greedy.xlsx", index=False)
+    if alloc_C is not None:
+        alloc_C.to_excel("Final_Allocation_CPSAT.xlsx", index=False)
+
+    best = results[rec]
+    best["alloc"].to_excel(FINAL_ALLOC_FILE, index=False)
+    with pd.ExcelWriter(ALLOC_REPORT_FILE, engine="openpyxl") as writer:
+        best["alloc"].to_excel(writer,   sheet_name="Full_Allocation",   index=False)
+        best["sumdf"].to_excel(writer,   sheet_name="Faculty_Summary",   index=False)
+        best["slotdf"].to_excel(writer,  sheet_name="Slot_Verification", index=False)
+        alloc_A.to_excel(writer, sheet_name="MILP_Allocation",   index=False)
+        alloc_B.to_excel(writer, sheet_name="Greedy_Allocation", index=False)
+        if alloc_C is not None:
+            alloc_C.to_excel(writer, sheet_name="CPSAT_Allocation", index=False)
+
+    st.session_state.update({
+        "alloc_milp":    alloc_A,   "alloc_greedy":  alloc_B,   "alloc_cpsat":   alloc_C,
+        "sumdf_milp":    sumdf_A,   "sumdf_greedy":  sumdf_B,   "sumdf_cpsat":   sumdf_C,
+        "slotdf_milp":   slotdf_A,  "slotdf_greedy": slotdf_B,  "slotdf_cpsat":  slotdf_C,
+        "pct_milp":      pct_A,     "pct_greedy":    pct_B,     "pct_cpsat":     pct_C,
+        "unmet_milp":    unmet_A,   "unmet_greedy":  unmet_B,   "unmet_cpsat":   unmet_C,
+        "gaps_milp":     gaps_A,    "gaps_greedy":   gaps_B,    "gaps_cpsat":    gaps_C,
+        "recommended":   rec,       "cpsat_ok":      ORTOOLS_OK,
+    })
+    log(f"\n  Saved: {FINAL_ALLOC_FILE}  ({rec} — default)")
+    return best["alloc"], best["sumdf"], best["slotdf"], best.get("desigdf", pd.DataFrame())
+
+
 # ═══════════════════════════════════════════════════════════════ #
-#                   SESSION STATE DEFAULTS                       #
+#              SESSION STATE DEFAULTS                            #
 # ═══════════════════════════════════════════════════════════════ #
 _defaults = {
     "logged_in":           False,
-    "admin_authenticated": False,
+    "faculty_id":          "",       # e.g. "C870" — the ID No. from Excel
+    "faculty_name":        "",       # display name
+    "faculty_clean":       "",       # clean(name) — still used for willingness matching
+    "is_admin":            False,
+    "must_change_pw":      False,
     "panel_mode":          "User View",
     "user_panel_mode":     "Willingness",
     "selected_faculty":    "",
@@ -1376,187 +1728,243 @@ for k, val in _defaults.items():
 
 
 # ═══════════════════════════════════════════════════════════════ #
-#                         LOGIN                                  #
+#                      LOGIN PAGE                                #
 # ═══════════════════════════════════════════════════════════════ #
-if not st.session_state.logged_in:
+def page_login(fac_df):
     render_header(logo=True)
     _, c2, _ = st.columns([1, 2, 1])
     with c2:
         st.markdown(
             '<div class="card"><div class="card-title">🔒 Faculty Login</div>'
-            '<p class="card-sub">Enter your credentials to access the portal.</p></div>',
+            '<p class="card-sub">Enter your Faculty ID and password to continue.</p></div>',
             unsafe_allow_html=True)
-        un = st.text_input("Username")
-        pw = st.text_input("Password", type="password")
+
+        if not BCRYPT_OK:
+            st.warning("⚠ bcrypt not installed — run `pip install bcrypt` for full security.")
+
+        fid_input = st.text_input("Faculty ID", placeholder="e.g. C870 or RS602").strip().upper().replace(" ", "")
+        pwd = st.text_input("Password", type="password")
+
         if st.button("Sign In", use_container_width=True):
-            if un == "SASTRA" and pw == "SASTRA":
-                st.session_state.logged_in = True
-                st.rerun()
+            pwd = pwd.strip()  # remove accidental leading/trailing spaces
+            if not fid_input or not pwd:
+                st.error("Please enter both your Faculty ID and password.")
             else:
-                st.error("Invalid credentials.")
+                # Robust ID lookup: normalise both sides (strip spaces, uppercase)
+                if "ID No." in fac_df.columns:
+                    id_col_vals = fac_df["ID No."].astype(str).str.strip().str.upper().str.replace(" ", "", regex=False)
+                    id_match = fac_df[id_col_vals == fid_input]
+                else:
+                    id_match = pd.DataFrame()
+
+                if id_match.empty:
+                    st.error(
+                        f"Faculty ID **{fid_input}** not found. "
+                        "Please enter your ID exactly as shown on your ID card (e.g. C2086, RS1051). "
+                        "Contact admin if the issue persists.")
+                else:
+                    pw_ensure(fid_input)   # create default entry if new
+                    entry = pw_get(fid_input)
+                    # Case-insensitive match for default password on first login
+                    # e.g. "Sastra" / "SASTRA" all accepted as "sastra"
+                    # Try user input first; if that fails and they typed the
+                    # default password (any case), also try the canonical form.
+                    # This handles: must_change_pw=False admins whose pw was reset,
+                    # case variants like "Sastra"/"SASTRA", and accidental spaces.
+                    pwd_candidates = [pwd]
+                    if pwd.lower() == DEFAULT_PASSWORD.lower():
+                        pwd_candidates.append(DEFAULT_PASSWORD)
+                    verified = any(
+                        entry and verify_password(p, entry["password_hash"])
+                        for p in pwd_candidates
+                    )
+                    if verified:
+                        frow_login = id_match.iloc[0]
+                        name_col = "Name" if "Name" in frow_login.index else "NAME OF STAFF"
+                        # If they logged in with the default password, force a change
+                        # regardless of what must_change_pw says in the JSON
+                        logged_with_default = pwd.lower() == DEFAULT_PASSWORD.lower()
+                        st.session_state.logged_in      = True
+                        st.session_state.faculty_id     = fid_input
+                        st.session_state.faculty_name   = str(frow_login[name_col]).strip()
+                        st.session_state.faculty_clean  = clean(frow_login[name_col])
+                        st.session_state.is_admin       = entry.get("is_admin", False)
+                        st.session_state.must_change_pw = (
+                            entry.get("must_change_pw", False) or logged_with_default)
+                        st.rerun()
+                    else:
+                        st.error(
+                            f"Incorrect password. Default first-time password is: **{DEFAULT_PASSWORD}**")
+
+        st.caption(
+            f"First-time login: your password is **{DEFAULT_PASSWORD}**. "
+            "You will be prompted to change it on first login.")
+
     st.markdown("---")
     st.caption("Curated by Dr. N. Sathiya Narayanan | School of Mechanical Engineering")
     st.stop()
 
 
 # ═══════════════════════════════════════════════════════════════ #
-#                      LOAD CORE DATA                            #
+#             FORCE PASSWORD CHANGE PAGE                         #
 # ═══════════════════════════════════════════════════════════════ #
-if not os.path.exists(FACULTY_FILE):
-    st.error(f"**{FACULTY_FILE}** not found. Place it in the same folder as app.py.")
+def page_force_change_password():
+    render_header(logo=False)
+    fid  = st.session_state.faculty_id
+    name = st.session_state.faculty_name
+    st.markdown(f"### 🔑 Set Your Password, {name.split()[0]}")
+    st.info("You must set a new password before continuing. "
+            "It must be at least 6 characters and must not be the default password.")
+    np1 = st.text_input("New Password", type="password", key="fc_np1")
+    np2 = st.text_input("Confirm New Password", type="password", key="fc_np2")
+    if st.button("Set Password & Continue", use_container_width=True, type="primary"):
+        if len(np1) < 6:
+            st.error("Password must be at least 6 characters.")
+        elif np1 == DEFAULT_PASSWORD:
+            st.error(f"New password cannot be the default password ({DEFAULT_PASSWORD}).")
+        elif np1 != np2:
+            st.error("Passwords do not match.")
+        else:
+            pw_update(fid, hash_password(np1), must_change=False)
+            st.session_state.must_change_pw = False
+            st.success("Password set successfully! Continuing…")
+            st.rerun()
+    st.markdown("---")
+    st.caption("Curated by Dr. N. Sathiya Narayanan | School of Mechanical Engineering")
     st.stop()
 
-fac_df = pd.read_excel(FACULTY_FILE)
-fac_df.columns = fac_df.columns.str.strip()
-_fc = fac_df.columns.tolist()
-fac_df.rename(columns={_fc[0]: "Name", _fc[1]: "Designation"}, inplace=True)
-fac_df = fac_df.dropna(subset=["Name"]).reset_index(drop=True)
-fac_df["Name"]  = fac_df["Name"].astype(str).str.strip()
-fac_df["Clean"] = fac_df["Name"].apply(clean)
-
-offline_df, online_df = load_slots(OFFLINE_FILE, ONLINE_FILE)
-
 
 # ═══════════════════════════════════════════════════════════════ #
-#                  HEADER + NOTICE BANNER                        #
+#            CHANGE PASSWORD SECTION (logged-in user)            #
 # ═══════════════════════════════════════════════════════════════ #
-render_header(logo=False)
-st.markdown(
-    "<div class='blink'><strong>Note:</strong> The University Examination Committee "
-    "sincerely appreciates your cooperation. Every effort will be made to accommodate "
-    "your willingness while adhering to institutional requirements. Final duty allocation "
-    "is carried out using AI-assisted MILP optimization.</div>",
-    unsafe_allow_html=True)
-st.markdown("")
-
-panel_mode = st.radio("Main Menu", ["User View", "Admin View"], horizontal=True, key="panel_mode")
+def section_change_password():
+    fid = st.session_state.faculty_id
+    with st.expander("🔑 Change My Password"):
+        op  = st.text_input("Current Password", type="password", key="usr_op")
+        np1 = st.text_input("New Password (min 6 chars)", type="password", key="usr_np1")
+        np2 = st.text_input("Confirm New Password", type="password", key="usr_np2")
+        if st.button("Update Password", key="usr_upd_pw"):
+            entry = pw_get(fid)
+            if not entry or not verify_password(op, entry["password_hash"]):
+                st.error("Current password is incorrect.")
+            elif len(np1) < 6:
+                st.error("New password must be at least 6 characters.")
+            elif np1 != np2:
+                st.error("Passwords do not match.")
+            elif np1 == DEFAULT_PASSWORD:
+                st.error(f"Cannot reuse the default password ({DEFAULT_PASSWORD}).")
+            else:
+                pw_update(fid, hash_password(np1), must_change=False)
+                st.success("Password updated successfully.")
 
 
 # ═══════════════════════════════════════════════════════════════ #
 #                        ADMIN VIEW                              #
 # ═══════════════════════════════════════════════════════════════ #
-if panel_mode == "Admin View":
+def page_admin(fac_df, offline_df, online_df):
     st.markdown(
-        '<div class="card"><div class="card-title">🔒 Admin View</div>'
-        '<p class="card-sub">Protected. Enter admin password to continue.</p></div>',
+        '<div class="card"><div class="card-title">🔒 Admin Panel</div>'
+        '<p class="card-sub">Full administrative access.</p></div>',
         unsafe_allow_html=True)
-    if not st.session_state.admin_authenticated:
-        ap = st.text_input("Admin Password", type="password", key="admpw")
-        if st.button("Unlock", use_container_width=True):
-            if ap == "sathya":
-                st.session_state.admin_authenticated = True
+
+    t1, t2, t3, t4, t5 = st.tabs([
+        "📋 Willingness Records",
+        "🤖 Run Optimizer",
+        "📊 View Results",
+        "👥 Faculty Accounts",
+        "⚙️ Portal Settings",
+    ])
+
+    # ── Tab 1: Willingness Records ──────────────────────────────── #
+    with t1:
+        st.markdown("### 📋 Willingness Records")
+        st.caption("All willingness submitted by faculty via this portal.")
+
+        w_all = get_all_willingness()
+        if w_all.empty:
+            st.info("No willingness data collected yet.")
+        else:
+            vdf = w_all.drop(columns=["FacultyClean"], errors="ignore").reset_index(drop=True)
+            if "Sl.No" not in vdf.columns:
+                vdf.insert(0, "Sl.No", vdf.index + 1)
+            sub_cnt_val = vdf["Faculty"].nunique() if "Faculty" in vdf.columns else 0
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Faculty Submitted",  sub_cnt_val)
+            c2.metric("Not Yet Submitted",  len(fac_df) - sub_cnt_val)
+            c3.metric("Total Rows",          len(vdf))
+            st.dataframe(vdf, use_container_width=True, hide_index=True)
+
+            st.markdown("#### ⬇ Download Collected Willingness")
+            dl1, dl2 = st.columns(2)
+            with dl1:
+                st.download_button(
+                    "⬇ Download as CSV",
+                    data=vdf[["Faculty", "Date", "Session"]].to_csv(index=False).encode("utf-8"),
+                    file_name="Willingness.csv", mime="text/csv",
+                    use_container_width=True)
+            with dl2:
+                _buf = io.BytesIO()
+                vdf[["Faculty", "Date", "Session"]].to_excel(_buf, index=False, engine="openpyxl")
+                st.download_button(
+                    "⬇ Download as Excel (.xlsx)",
+                    data=_buf.getvalue(),
+                    file_name="Willingness.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True)
+            st.caption("After downloading, go to **🤖 Run Optimizer** → upload → run.")
+
+        st.markdown("---")
+        st.markdown("#### ⚠ Clear In-Session Submissions")
+        st.checkbox("Confirm clearing all in-session submissions", key="confirm_delete")
+        if st.button("Clear Session Submissions", type="primary"):
+            if st.session_state.confirm_delete:
+                st.session_state.pending_submissions = pd.DataFrame(
+                    columns=["Faculty", "Date", "Session"])
+                st.success("Cleared.")
+                st.session_state.confirm_delete = False
                 st.rerun()
             else:
-                st.error("Incorrect password.")
-    else:
-        st.success("✅ Admin unlocked.")
+                st.error("Tick the confirmation checkbox first.")
 
-        t1, t2, t3, t4 = st.tabs([
-            "📋 Willingness Records",
-            "🤖 Run Optimizer",
-            "📊 View Results",
-            "⚙️ Portal Settings",
-        ])
+    # ── Tab 2: Run Optimizer ─────────────────────────────────────── #
+    with t2:
+        st.markdown("### 🤖 Run Allocation Optimizer")
+        st.markdown("#### 📤 Step 1 — Upload Willingness File")
+        st.caption("Download from **📋 Willingness Records** tab, then upload here.")
 
-        # ── Tab 1: Willingness Records ────────────────────────────
-        with t1:
-            st.markdown("### 📋 Willingness Records")
-            st.caption("All willingness submitted by faculty via this portal is shown below.")
+        if st.session_state.get("uploaded_willingness_bytes"):
+            st.success("✅ Willingness file uploaded and ready.")
+            if st.button("🗑 Remove Uploaded File", type="secondary", key="rm_will"):
+                del st.session_state["uploaded_willingness_bytes"]
+                st.rerun()
+        else:
+            st.warning("⚠ No willingness file uploaded yet.")
 
-            w_all = get_all_willingness()
-            if w_all.empty:
-                st.info("No willingness data collected yet. Faculty must submit via the User View → Willingness tab.")
-            else:
-                vdf = w_all.drop(columns=["FacultyClean"], errors="ignore").reset_index(drop=True)
-                if "Sl.No" not in vdf.columns:
-                    vdf.insert(0, "Sl.No", vdf.index + 1)
-                sub_cnt_val = vdf["Faculty"].nunique() if "Faculty" in vdf.columns else 0
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Faculty Submitted",  sub_cnt_val)
-                c2.metric("Not Yet Submitted",  len(fac_df) - sub_cnt_val)
-                c3.metric("Total Rows",          len(vdf))
-                st.dataframe(vdf, use_container_width=True, hide_index=True)
+        uploaded_will = st.file_uploader(
+            "Upload Willingness.xlsx", type=["xlsx", "xls"], key="will_uploader")
+        if uploaded_will is not None:
+            raw_bytes = uploaded_will.read()
+            st.session_state["uploaded_willingness_bytes"] = raw_bytes
+            _prev = pd.read_excel(io.BytesIO(raw_bytes))
+            st.success(
+                f"✅ '{uploaded_will.name}' uploaded — "
+                f"{len(_prev)} rows, "
+                f"{_prev['Faculty'].nunique() if 'Faculty' in _prev.columns else '?'} faculty.")
 
-                st.markdown("#### ⬇ Download Collected Willingness")
-                dl1, dl2 = st.columns(2)
-                with dl1:
-                    st.download_button(
-                        "⬇ Download as CSV",
-                        data=vdf[["Faculty", "Date", "Session"]].to_csv(index=False).encode("utf-8"),
-                        file_name="Willingness.csv", mime="text/csv",
-                        use_container_width=True)
-                with dl2:
-                    import io as _io
-                    _buf = _io.BytesIO()
-                    vdf[["Faculty", "Date", "Session"]].to_excel(_buf, index=False, engine="openpyxl")
-                    st.download_button(
-                        "⬇ Download as Excel (.xlsx)",
-                        data=_buf.getvalue(),
-                        file_name="Willingness.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True)
-                st.caption("After downloading, go to **🤖 Run Optimizer** tab → upload this file → run the optimizer.")
+        st.markdown("---")
+        st.markdown("#### 📁 Step 2 — File Status Check")
+        def fstat(f): return "✅ Found" if os.path.exists(f) else "❌ Missing"
+        _wb = st.session_state.get("uploaded_willingness_bytes")
+        if _wb:
+            _wdf_c  = pd.read_excel(io.BytesIO(_wb))
+            _wrows  = len(_wdf_c)
+            _wfac   = _wdf_c["Faculty"].nunique() if "Faculty" in _wdf_c.columns else 0
+            wstat   = f"✅ Uploaded — {_wrows} rows, {_wfac} faculty"
+        else:
+            wstat = "⚠ Not uploaded — upload above first"
+            _wrows, _wfac = 0, 0
 
-            st.markdown("---")
-            st.markdown("#### ⚠ Clear In-Session Submissions")
-            st.caption("Use this only to reset willingness submitted in the current session (e.g. for a fresh collection round).")
-            st.checkbox("Confirm clearing all in-session submissions", key="confirm_delete")
-            if st.button("Clear Session Submissions", type="primary"):
-                if st.session_state.confirm_delete:
-                    st.session_state.pending_submissions = pd.DataFrame(columns=["Faculty", "Date", "Session"])
-                    st.success("Cleared.")
-                    st.session_state.confirm_delete = False
-                    st.rerun()
-                else:
-                    st.error("Tick the confirmation checkbox first.")
-
-        # ── Tab 2: Run Optimizer ──────────────────────────────────
-        with t2:
-            st.markdown("### 🤖 Run Allocation Optimizer")
-
-            # ── Step 1: Upload willingness ────────────────────────
-            st.markdown("#### 📤 Step 1 — Upload Willingness File")
-            st.caption("Download the willingness from the **📋 Willingness Records** tab, then upload it here.")
-
-            if st.session_state.get("uploaded_willingness_bytes"):
-                st.success("✅ Willingness file uploaded and ready for optimizer.")
-                if st.button("🗑 Remove Uploaded File", type="secondary", key="rm_will"):
-                    del st.session_state["uploaded_willingness_bytes"]
-                    st.rerun()
-            else:
-                st.warning("⚠ No willingness file uploaded yet. Upload the downloaded Willingness.xlsx below.")
-
-            uploaded_will = st.file_uploader(
-                "Upload Willingness.xlsx",
-                type=["xlsx", "xls"],
-                key="will_uploader",
-                help="Upload the Willingness.xlsx downloaded from the Willingness Records tab."
-            )
-            if uploaded_will is not None:
-                raw_bytes = uploaded_will.read()
-                st.session_state["uploaded_willingness_bytes"] = raw_bytes
-                import io as _io2
-                _prev = pd.read_excel(_io2.BytesIO(raw_bytes))
-                st.success(
-                    f"✅ '{uploaded_will.name}' uploaded — "
-                    f"{len(_prev)} rows, {_prev['Faculty'].nunique() if 'Faculty' in _prev.columns else '?'} faculty."
-                )
-
-            st.markdown("---")
-            # ── Step 2: File status ───────────────────────────────
-            st.markdown("#### 📁 Step 2 — File Status Check")
-            def fstat(f): return "✅ Found" if os.path.exists(f) else "❌ Missing"
-            _wb = st.session_state.get("uploaded_willingness_bytes")
-            if _wb:
-                import io as _io3
-                _wdf_check = pd.read_excel(_io3.BytesIO(_wb))
-                _wrows = len(_wdf_check)
-                _wfac  = _wdf_check["Faculty"].nunique() if "Faculty" in _wdf_check.columns else 0
-                wstat = f"✅ Uploaded — {_wrows} rows, {_wfac} faculty"
-            else:
-                wstat = "⚠ Not uploaded — upload above first"
-                _wrows, _wfac = 0, 0
-            st.markdown(f"""
+        st.markdown(f"""
 | File | Purpose | Status |
 |---|---|---|
 | `Faculty_Master.xlsx` | Faculty list + designations | {fstat(FACULTY_FILE)} |
@@ -1564,345 +1972,356 @@ if panel_mode == "Admin View":
 | `Online_Duty.xlsx`    | Online exam slots           | {fstat(ONLINE_FILE)} |
 | `Willingness.xlsx`    | Faculty willingness         | {wstat} |
 """)
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Total Faculty",         len(fac_df))
-            c2.metric("Willingness Submitted", f"{_wfac}/{len(fac_df)}")
-            c3.metric("Willingness Rows",      _wrows)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total Faculty",         len(fac_df))
+        c2.metric("Willingness Submitted", f"{_wfac}/{len(fac_df)}")
+        c3.metric("Willingness Rows",      _wrows)
 
-            if not os.path.exists(FACULTY_FILE) or not os.path.exists(OFFLINE_FILE):
-                st.error("Faculty_Master.xlsx and Offline_Duty.xlsx are required.")
-            elif not ORTOOLS_OK:
-                st.error("OR-Tools not installed. Run: pip install ortools")
-            else:
-                # ── Date Overlap Diagnostic Panel ─────────────────────
-                st.markdown("#### 🔍 Pre-Run Diagnostic")
-                diag_wdf = get_all_willingness()
-                diag_off = parse_duty_file(OFFLINE_FILE, "Offline")
-                diag_on  = parse_duty_file(ONLINE_FILE,  "Online")
-                diag_slots = diag_off + diag_on
-                slot_dates_diag = {s["date"] for s in diag_slots}
+        if not os.path.exists(FACULTY_FILE) or not os.path.exists(OFFLINE_FILE):
+            st.error("Faculty_Master.xlsx and Offline_Duty.xlsx are required.")
+        elif not ORTOOLS_OK and not SCIPY_OK:
+            st.error("No solver available. Run:  pip install ortools  OR  pip install scipy")
+        else:
+            solver_label = "OR-Tools CP-SAT ✅" if ORTOOLS_OK else "scipy HiGHS (fallback) ⚠"
+            st.info(f"🔧 Active solver: **{solver_label}**"
+                    + ("" if ORTOOLS_OK else
+                       " — install OR-Tools for better results:  `pip install ortools`"))
 
-                if not diag_wdf.empty and slot_dates_diag:
-                    wdf_diag = diag_wdf.copy()
-                    wdf_diag["_date"] = pd.to_datetime(
-                        wdf_diag["Date"], dayfirst=True, errors="coerce").dt.date
-                    will_dates_diag = set(wdf_diag["_date"].dropna())
-                    overlap_diag    = will_dates_diag & slot_dates_diag
-                    only_will_diag  = will_dates_diag - slot_dates_diag
+            st.markdown("#### 🔍 Pre-Run Diagnostic")
+            diag_wdf   = get_all_willingness()
+            diag_slots = (parse_duty_file(OFFLINE_FILE, "Offline") +
+                          parse_duty_file(ONLINE_FILE, "Online"))
+            slot_dates_diag = {s["date"] for s in diag_slots}
 
-                    d1, d2, d3 = st.columns(3)
-                    d1.metric("Slot Dates",        len(slot_dates_diag))
-                    d2.metric("Willingness Dates", len(will_dates_diag))
-                    d3.metric("✅ Overlapping",     len(overlap_diag),
-                              delta="⚠ ZERO — dates don't match!" if len(overlap_diag) == 0 else None,
-                              delta_color="inverse" if len(overlap_diag) == 0 else "off")
+            if not diag_wdf.empty and slot_dates_diag:
+                wdf_diag = diag_wdf.copy()
+                wdf_diag["_date"] = pd.to_datetime(
+                    wdf_diag["Date"], dayfirst=True, errors="coerce").dt.date
+                will_dates_diag = set(wdf_diag["_date"].dropna())
+                overlap_diag    = will_dates_diag & slot_dates_diag
+                only_will_diag  = will_dates_diag - slot_dates_diag
 
-                    if len(overlap_diag) == 0:
-                        st.error(
-                            "🚨 **CRITICAL: Zero date overlap detected!**\n\n"
-                            "The dates submitted in Willingness.xlsx do NOT match any exam slot dates.\n\n"
-                            "**Likely causes:**\n"
-                            "- Faculty submitted dates outside the exam period\n"
-                            "- Date format mismatch in Willingness.xlsx (e.g. text vs Excel date)\n"
-                            "- Wrong Willingness.xlsx file uploaded\n\n"
-                            "**Fix:** Ask faculty to resubmit using this portal's calendar, "
-                            "or verify Willingness.xlsx date column format."
-                        )
-                    elif len(only_will_diag) > len(overlap_diag):
-                        st.warning(
-                            f"⚠️ **{len(only_will_diag)} willingness dates fall outside exam slot dates** "
-                            f"(only {len(overlap_diag)} of {len(will_dates_diag)} dates overlap). "
-                            f"Match rate will be low. Ask faculty to resubmit using the portal calendar."
-                        )
-                    else:
-                        st.success(
-                            f"✅ {len(overlap_diag)} willingness dates overlap with slot dates. "
-                            f"Good coverage — optimizer should produce reasonable match rates."
-                        )
+                d1, d2, d3 = st.columns(3)
+                d1.metric("Slot Dates",        len(slot_dates_diag))
+                d2.metric("Willingness Dates", len(will_dates_diag))
+                d3.metric("✅ Overlapping",     len(overlap_diag),
+                          delta="⚠ ZERO — dates don't match!" if len(overlap_diag) == 0 else None,
+                          delta_color="inverse" if len(overlap_diag) == 0 else "off")
 
-                    # Show slot date range vs willingness date range
-                    if slot_dates_diag and will_dates_diag:
-                        st.markdown(
-                            f"**Slot period:** {min(slot_dates_diag).strftime('%d-%m-%Y')} → "
-                            f"{max(slot_dates_diag).strftime('%d-%m-%Y')}  &nbsp;|&nbsp;  "
-                            f"**Willingness period:** {min(will_dates_diag).strftime('%d-%m-%Y')} → "
-                            f"{max(will_dates_diag).strftime('%d-%m-%Y')}",
-                            unsafe_allow_html=True
-                        )
-
-                    # Show non-overlapping willingness dates as a table
-                    if only_will_diag:
-                        with st.expander(f"📋 View {len(only_will_diag)} willingness date(s) NOT in any slot"):
-                            bad_rows = wdf_diag[wdf_diag["_date"].isin(only_will_diag)]\
-                                .drop(columns=["_date","FacultyClean"], errors="ignore")\
-                                .reset_index(drop=True)
-                            st.dataframe(bad_rows, use_container_width=True, hide_index=True)
-                        # Per-faculty breakdown
-                        with st.expander("👥 Which faculty submitted dates outside the exam period?"):
-                            _bad_fac = wdf_diag[wdf_diag["_date"].isin(only_will_diag)].copy()
-                            _bad_fac_grp = (
-                                _bad_fac.groupby("Faculty")
-                                .agg(OutOfRange_Dates=("Date", "count"))
-                                .reset_index()
-                                .sort_values("OutOfRange_Dates", ascending=False)
-                            )
-                            st.dataframe(_bad_fac_grp, use_container_width=True, hide_index=True)
-                            st.warning(
-                                "⬆ These faculty submitted willingness on dates that are NOT exam days. "
-                                "Please ask them to log in again and resubmit using the portal calendar. "
-                                "The portal's date picker only shows valid exam dates, "
-                                "so resubmitting via the portal will fix this automatically."
-                            )
+                if len(overlap_diag) == 0:
+                    st.error("🚨 **CRITICAL: Zero date overlap!** Willingness dates don't match any exam slots.")
+                elif len(only_will_diag) > len(overlap_diag):
+                    st.warning(f"⚠️ {len(only_will_diag)} willingness dates outside slot period "
+                               f"(only {len(overlap_diag)}/{len(will_dates_diag)} overlap).")
                 else:
-                    st.info("Upload willingness data and ensure slot files exist to run diagnostic.")
+                    st.success(f"✅ {len(overlap_diag)} overlapping dates — good coverage.")
 
-                st.markdown("---")
-                st.info(
-                    "💡 Recommended: Disable the allotment view (Portal Settings) before "
-                    "running, then re-enable after reviewing results.")
-                if st.button("▶ Run Optimizer", type="primary", use_container_width=True):
-                    lb2 = st.empty()
-                    will_bytes_snapshot = st.session_state.get("uploaded_willingness_bytes", None)
-                    with st.spinner("Running optimization..."):
-                        try:
-                            if will_bytes_snapshot is not None:
-                                st.session_state["uploaded_willingness_bytes"] = will_bytes_snapshot
-                            alloc_out, sumdf_out, slotdf_out, _ = run_optimizer(lb2)
-                            st.success("✅ Optimization complete! Review results, then enable the allotment view.")
-
-                            wd_check = get_all_willingness()
-                            fr_check = pd.read_excel(FACULTY_FILE)
-                            fr_check.columns = fr_check.columns.str.strip()
-                            fr_check.rename(columns={fr_check.columns[0]: "Name",
-                                                     fr_check.columns[1]: "Designation"}, inplace=True)
-                            fr_check["Name"]        = fr_check["Name"].astype(str).str.strip()
-                            fr_check["Designation"] = fr_check["Designation"].astype(str).str.strip().str.upper()
-
-                            sub_set  = set(wd_check["Faculty"].str.strip().unique()) if not wd_check.empty else set()
-                            sub_cnt  = {}
-                            if not wd_check.empty:
-                                for nm, grp in wd_check.groupby("Faculty"):
-                                    sub_cnt[nm.strip()] = len(grp)
-
-                            no_sub_names    = []
-                            under_sub_names = []
-                            for _, frow in fr_check.iterrows():
-                                nm   = frow["Name"]
-                                desig = str(frow["Designation"]).strip().upper()
-                                req  = DESIG_RULES.get(desig if desig in DESIG_RULES else "TA", (0,0))[0]
-                                if nm not in sub_set:
-                                    no_sub_names.append((nm, desig, req))
-                                elif sub_cnt.get(nm, 0) < req:
-                                    under_sub_names.append((nm, desig, sub_cnt.get(nm,0), req))
-
-                            if no_sub_names or under_sub_names:
-                                st.markdown("---")
-                                st.markdown("#### ⚠️ Willingness Submission Issues")
-                                if no_sub_names:
-                                    st.error(f"**{len(no_sub_names)} faculty did not submit willingness:**")
-                                    rows = [{"Name": nm, "Designation": DESIG_FULL.get(d, d),
-                                             "Required Duties": r} for nm, d, r in no_sub_names]
-                                    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-                                if under_sub_names:
-                                    st.warning(f"**{len(under_sub_names)} faculty submitted fewer dates than required:**")
-                                    rows = [{"Name": nm, "Designation": DESIG_FULL.get(d, d),
-                                             "Submitted": g, "Required": r,
-                                             "Shortfall": r - g}
-                                            for nm, d, g, r in under_sub_names]
-                                    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-                            st.balloons()
-                        except Exception as e:
-                            import traceback
-                            st.error(f"Optimizer error: {e}")
-                            st.code(traceback.format_exc(), language="text")
-
-        # ── Tab 3: View Results ───────────────────────────────────
-        with t3:
-            st.markdown("### Allocation Results")
-            if not os.path.exists(FINAL_ALLOC_FILE):
-                st.info("No results yet. Run the optimizer first.")
+                if only_will_diag:
+                    with st.expander(f"📋 {len(only_will_diag)} willingness dates NOT in any slot"):
+                        bad = wdf_diag[wdf_diag["_date"].isin(only_will_diag)]\
+                            .drop(columns=["_date", "FacultyClean"], errors="ignore")\
+                            .reset_index(drop=True)
+                        st.dataframe(bad, use_container_width=True, hide_index=True)
             else:
-                av  = pd.read_excel(FINAL_ALLOC_FILE)
-                rep = {}
-                if os.path.exists(ALLOC_REPORT_FILE):
-                    xl2 = pd.ExcelFile(ALLOC_REPORT_FILE)
-                    for sh in xl2.sheet_names: rep[sh] = xl2.parse(sh)
+                st.info("Upload willingness and ensure slot files exist to run diagnostic.")
 
-                tot2 = len(av)
-                if tot2 > 0 and "Allocated_By" in av.columns:
-                    ab3    = av["Allocated_By"]
-                    will_m = int(ab3.isin(WILL_TAGS).sum())
-                    aut    = int(ab3.isin(["Auto-Assigned", "OR-Assigned", "Gap-Fill", "Gap-Fill-R2", "Gap-Fill-R3", "Gap-Fill-R4", "Gap-Fill-R5"]).sum())
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Total Assignments",  int(tot2))
-                    c2.metric("Willingness Matched", will_m)
-                    c3.metric("Auto-Assigned",        aut)
-                    c4.metric("Overall Match %",      f"{will_m / tot2 * 100:.1f}%")
-
-                for sh_name, label in [("Designation_Summary", "Designation Summary"),
-                                       ("Slot_Verification",   "Slot Verification"),
-                                       ("Faculty_Summary",     "Faculty Summary")]:
-                    if sh_name in rep:
-                        st.markdown(f"#### {label}")
-                        if sh_name == "Slot_Verification" and "Status" in rep[sh_name].columns:
-                            um = rep[sh_name][~rep[sh_name]["Status"].str.startswith("✓")]
-                            total_slots = len(rep[sh_name])
-                            met_slots   = total_slots - len(um)
-                            if len(um) == 0:
-                                st.metric("Slots Fulfilled", f"{met_slots}/{total_slots}",
-                                          delta="✅ All Slots Met")
-                            else:
-                                st.metric("Slots Fulfilled", f"{met_slots}/{total_slots}",
-                                          delta=f"⚠ {len(um)} unmet — see rows below",
-                                          delta_color="inverse")
-                                st.error(
-                                    f"⚠️ **{len(um)} slot(s) could not be fully filled.** "
-                                    "This usually means there are not enough eligible faculty for that "
-                                    "specific slot type. "
-                                    "**Fix:** Increase faculty count in Faculty_Master.xlsx, "
-                                    "or reduce the required count in Offline_Duty.xlsx / Online_Duty.xlsx."
-                                )
-                        st.dataframe(rep[sh_name], use_container_width=True, hide_index=True)
-
-                st.markdown("---")
-                st.markdown("#### 🔍 Per-Faculty Deviation Analysis")
-                st.caption("Select a faculty member to inspect their willingness match and deviation details.")
-                admin_fnames = fac_df["Name"].dropna().drop_duplicates().tolist()
-                admin_sel    = st.selectbox("Select Faculty", admin_fnames, key="admin_dev_sel")
-                admin_sc     = clean(admin_sel)
-
-                wd_admin = load_willingness()
-                admin_will_set = set()
-                if not wd_admin.empty:
-                    wm_admin = fac_mask(wd_admin, admin_sc)
-                    wr_admin = wd_admin[wm_admin]
-                    if not wr_admin.empty and {"Date", "Session"}.issubset(wr_admin.columns):
-                        for d2, s2 in zip(wr_admin["Date"], wr_admin["Session"]):
-                            nd = pd.to_datetime(d2, dayfirst=True, errors="coerce")
-                            if pd.notna(nd):
-                                admin_will_set.add((nd.date(), str(s2).upper()))
-
-                am_admin = fac_mask(av, admin_sc)
-                admin_allot_rows = av[am_admin].copy()
-                render_deviation_section(admin_allot_rows, admin_will_set)
-
-                st.markdown("---")
-                st.markdown("#### Full Allocation Table")
-                st.dataframe(av, use_container_width=True, hide_index=True)
-                col1, col2 = st.columns(2)
-                with col1:
-                    with open(FINAL_ALLOC_FILE, "rb") as fh:
-                        st.download_button("⬇ Final_Allocation.xlsx", data=fh.read(),
-                            file_name="Final_Allocation.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-                with col2:
-                    with open(ALLOC_REPORT_FILE, "rb") as fh:
-                        st.download_button("⬇ Allocation_Report.xlsx", data=fh.read(),
-                            file_name="Allocation_Report.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-        # ── Tab 4: Portal Settings ────────────────────────────────
-        with t4:
-            st.markdown("### ⚙️ Portal Settings")
             st.markdown("---")
-            st.markdown("#### 🔒 Allotment View — User Access Control")
-            st.markdown(
-                "Control whether faculty can see their final duty allotment. "
-                "**Disable** before running the optimizer. "
-                "**Enable** once you have reviewed and approved the allocation.")
+            st.info("💡 Recommended: Disable allotment view (Portal Settings) before running.")
+            if st.button("▶ Run Optimizer", type="primary", use_container_width=True):
+                lb2 = st.empty()
+                with st.spinner("Running MILP optimization…"):
+                    try:
+                        alloc_out, sumdf_out, slotdf_out, _ = run_optimizer(lb2)
+                        st.success("✅ Optimization complete! Go to **📊 View Results** to review.")
+                        st.balloons()
+                    except Exception as e:
+                        import traceback
+                        st.error(f"Optimizer error: {e}")
+                        st.code(traceback.format_exc(), language="text")
 
-            is_open = gate_is_open()
+    # ── Tab 3: View Results ─────────────────────────────────────── #
+    with t3:
+        st.markdown("### 📊 Allocation Results")
 
-            if is_open:
-                st.markdown(
-                    "<div style='background:#d1fae5;border:1.5px solid #6ee7b7;"
-                    "border-radius:10px;padding:12px 18px;margin-bottom:14px'>"
-                    "<span style='font-size:1.05rem;font-weight:700;color:#065f46'>"
-                    "🟢  Allotment view is ENABLED — faculty can see their allotment.</span>"
-                    "</div>", unsafe_allow_html=True)
-            else:
-                st.markdown(
-                    "<div style='background:#fee2e2;border:1.5px solid #fca5a5;"
-                    "border-radius:10px;padding:12px 18px;margin-bottom:14px'>"
-                    "<span style='font-size:1.05rem;font-weight:700;color:#991b1b'>"
-                    "🔴  Allotment view is DISABLED — faculty see a waiting message.</span>"
-                    "</div>", unsafe_allow_html=True)
+        pct_m   = st.session_state.get("pct_milp",    None)
+        pct_g   = st.session_state.get("pct_greedy",  None)
+        unmet_m = st.session_state.get("unmet_milp",  None)
+        unmet_g = st.session_state.get("unmet_greedy",None)
+        rec     = st.session_state.get("recommended", "MILP")
 
-            en_col, dis_col = st.columns(2)
-            with en_col:
-                if st.button("✅ Enable Allotment View", use_container_width=True,
-                             disabled=is_open, type="primary"):
-                    set_gate(True)
-                    st.success("Allotment view ENABLED.")
-                    st.rerun()
-            with dis_col:
-                if st.button("🔴 Disable Allotment View", use_container_width=True,
-                             disabled=not is_open):
-                    set_gate(False)
-                    st.warning("Allotment view DISABLED.")
+        if pct_m is not None and pct_g is not None:
+            st.markdown("#### ⚖️ Method Comparison")
+            c1, c2 = st.columns(2)
+            def method_card(col, name, pct, unmet, is_rec):
+                bg   = "#d1fae5" if is_rec else "#f1f5f9"
+                bdr  = "#6ee7b7" if is_rec else "#e2e8f0"
+                badge = " ⭐ Recommended" if is_rec else ""
+                col.markdown(f"""
+<div style="background:{bg};border:2px solid {bdr};border-radius:12px;
+            padding:16px 18px;text-align:center">
+  <div style="font-size:1.05rem;font-weight:800;color:#0f172a">{name}{badge}</div>
+  <div style="font-size:2rem;font-weight:900;color:#0b3a67;margin:8px 0">{pct:.1f}%</div>
+  <div style="font-size:.85rem;color:#475569">Willingness Match</div>
+  <div style="margin-top:8px;font-size:.9rem;color:{'#065f46' if unmet==0 else '#991b1b'};font-weight:700">
+    {'✅ All slots filled' if unmet==0 else f'⚠ {unmet} slot(s) unmet'}
+  </div>
+</div>""", unsafe_allow_html=True)
+
+            with c1: method_card(c1, "Method A — MILP",   pct_m, unmet_m, rec=="MILP")
+            with c2: method_card(c2, "Method B — Greedy", pct_g, unmet_g, rec=="Greedy")
+
+            chosen = st.radio(
+                "**Select method to activate as Final Allocation:**",
+                ["Method A — MILP", "Method B — Greedy"],
+                index=0 if rec=="MILP" else 1,
+                horizontal=True, key="method_choice")
+
+            if st.button("✅ Apply Selected Method", type="primary", use_container_width=True):
+                chosen_key = "MILP" if "MILP" in chosen else "Greedy"
+                sel_alloc  = st.session_state.get(f"alloc_{chosen_key.lower()}")
+                sel_sumdf  = st.session_state.get(f"sumdf_{chosen_key.lower()}")
+                sel_slotdf = st.session_state.get(f"slotdf_{chosen_key.lower()}")
+                if sel_alloc is not None:
+                    sel_alloc.to_excel(FINAL_ALLOC_FILE, index=False)
+                    with pd.ExcelWriter(ALLOC_REPORT_FILE, engine="openpyxl") as writer:
+                        sel_alloc.to_excel(writer,  sheet_name="Full_Allocation",   index=False)
+                        sel_sumdf.to_excel(writer,  sheet_name="Faculty_Summary",   index=False)
+                        sel_slotdf.to_excel(writer, sheet_name="Slot_Verification", index=False)
+                    st.success(f"✅ {chosen_key} method saved as Final_Allocation.xlsx")
+                    st.session_state["recommended"] = chosen_key
                     st.rerun()
 
-            st.caption(
-                "📌 Recommended workflow: Disable → Run Optimizer (Tab 2) → "
-                "Review in View Results (Tab 3) → Enable when satisfied.")
+            st.markdown("#### ⬇ Download Both Results")
+            dl1, dl2 = st.columns(2)
+            with dl1:
+                fp = "Final_Allocation_MILP.xlsx"
+                if os.path.exists(fp):
+                    with open(fp, "rb") as fh:
+                        st.download_button("⬇ MILP Allocation", data=fh.read(),
+                            file_name=fp, use_container_width=True,
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            with dl2:
+                fp = "Final_Allocation_Greedy.xlsx"
+                if os.path.exists(fp):
+                    with open(fp, "rb") as fh:
+                        st.download_button("⬇ Greedy Allocation", data=fh.read(),
+                            file_name=fp, use_container_width=True,
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            st.markdown("---")
+
+        if not os.path.exists(FINAL_ALLOC_FILE):
+            st.info("No results yet. Run the optimizer first.")
+        else:
+            av  = pd.read_excel(FINAL_ALLOC_FILE)
+            rep = {}
+            if os.path.exists(ALLOC_REPORT_FILE):
+                xl2 = pd.ExcelFile(ALLOC_REPORT_FILE)
+                for sh in xl2.sheet_names: rep[sh] = xl2.parse(sh)
+
+            tot2 = len(av)
+            if tot2 > 0 and "Allocated_By" in av.columns:
+                ab3    = av["Allocated_By"]
+                will_m = int(ab3.isin(WILL_TAGS).sum())
+                aut    = int(ab3.isin(["Auto-Assigned","OR-Assigned","Gap-Fill"]).sum())
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Total Assignments",   tot2)
+                c2.metric("Willingness Matched", will_m)
+                c3.metric("Auto-Assigned",        aut)
+                c4.metric("Overall Match %",      f"{will_m/tot2*100:.1f}%")
+
+            for sh_name, label in [("Designation_Summary","Designation Summary"),
+                                   ("Slot_Verification",  "Slot Verification"),
+                                   ("Faculty_Summary",    "Faculty Summary")]:
+                if sh_name in rep:
+                    st.markdown(f"#### {label}")
+                    if sh_name == "Slot_Verification" and "Status" in rep[sh_name].columns:
+                        um = rep[sh_name][~rep[sh_name]["Status"].str.startswith("✓")]
+                        ts = len(rep[sh_name]); ms2 = ts - len(um)
+                        if len(um) == 0:
+                            st.metric("Slots Fulfilled", f"{ms2}/{ts}", delta="✅ All Slots Met")
+                        else:
+                            st.metric("Slots Fulfilled", f"{ms2}/{ts}",
+                                      delta=f"⚠ {len(um)} unmet", delta_color="inverse")
+                            for _, r in um.iterrows():
+                                st.error(f"⚠ {r['Date']} {r['Session']} {r['Type']} — {r['Status']}")
+                    st.dataframe(rep[sh_name], use_container_width=True, hide_index=True)
 
             st.markdown("---")
-            st.markdown("#### 🗓️ Semester Setting")
+            st.markdown("#### 🔍 Per-Faculty Deviation Analysis")
+            admin_fnames = fac_df["Name"].dropna().drop_duplicates().tolist()
+            admin_sel    = st.selectbox("Select Faculty", admin_fnames, key="admin_dev_sel")
+            admin_sc     = clean(admin_sel)
+            wd_admin     = load_willingness()
+            admin_will_set = set()
+            if not wd_admin.empty:
+                wm_a = fac_mask(wd_admin, admin_sc)
+                wr_a = wd_admin[wm_a]
+                if not wr_a.empty and {"Date","Session"}.issubset(wr_a.columns):
+                    for d2, s2 in zip(wr_a["Date"], wr_a["Session"]):
+                        nd = pd.to_datetime(d2, dayfirst=True, errors="coerce")
+                        if pd.notna(nd):
+                            admin_will_set.add((nd.date(), str(s2).upper()))
+            am_a = fac_mask(av, admin_sc)
+            render_deviation_section(av[am_a].copy(), admin_will_set)
+
+            st.markdown("---")
+            st.markdown("#### Full Allocation Table")
+            st.dataframe(av, use_container_width=True, hide_index=True)
+            col1, col2 = st.columns(2)
+            with col1:
+                with open(FINAL_ALLOC_FILE, "rb") as fh:
+                    st.download_button("⬇ Final_Allocation.xlsx", data=fh.read(),
+                        file_name="Final_Allocation.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            with col2:
+                with open(ALLOC_REPORT_FILE, "rb") as fh:
+                    st.download_button("⬇ Allocation_Report.xlsx", data=fh.read(),
+                        file_name="Allocation_Report.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    # ── Tab 4: Faculty Accounts ─────────────────────────────────── #
+    with t4:
+        st.markdown("### 👥 Faculty Account Management")
+        st.caption("View all faculty accounts (keyed by ID No.), reset passwords, and manage admin rights.")
+
+        store = _load_pw_store()
+        # Build id→name lookup from fac_df
+        _name_col_adm = "Name" if "Name" in fac_df.columns else (
+            "NAME OF STAFF" if "NAME OF STAFF" in fac_df.columns else fac_df.columns[0])
+        id_name_map = {
+            str(row["ID No."]).strip().upper().replace(" ", ""): row[_name_col_adm]
+            for _, row in fac_df.iterrows()
+        }
+
+        # Ensure all faculty have a password entry
+        if st.button("🔄 Sync Accounts from Faculty_Master.xlsx"):
+            pw_ensure_all(list(id_name_map.keys()))
+            st.success(f"All {len(id_name_map)} accounts synced.")
+            st.rerun()
+
+        acc_rows = []
+        for fid_key, nm in id_name_map.items():
+            entry2 = store.get(fid_key, {})
+            acc_rows.append({
+                "ID No.":       fid_key,
+                "Name":         nm,
+                "Password Set": "✅ Yes" if entry2.get("password_hash") else "❌ No (not logged in yet)",
+                "Must Change":  "⚠ Yes" if entry2.get("must_change_pw") else "No",
+                "Is Admin":     "👑 Yes" if entry2.get("is_admin") else "No",
+            })
+        acc_df = pd.DataFrame(acc_rows)
+        acc_df.insert(0, "Sl.No", acc_df.index + 1)
+        st.dataframe(acc_df, use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+        st.markdown("#### 🔑 Reset a Faculty's Password")
+        st.caption(f"Resets password to default (**{DEFAULT_PASSWORD}**) and forces change on next login.")
+        id_options = [f"{fid} — {nm}" for fid, nm in id_name_map.items()]
+        reset_sel  = st.selectbox("Select Faculty to Reset", id_options, key="admin_reset_sel")
+        reset_fid  = reset_sel.split(" — ")[0]
+        if st.button("Reset Password", key="btn_reset_pw"):
+            pw_reset(reset_fid)
+            st.success(f"Password for **{id_name_map.get(reset_fid, reset_fid)}** (ID: {reset_fid}) reset to default.")
+
+        st.markdown("---")
+        st.markdown("#### 👑 Toggle Admin Rights")
+        toggle_sel = st.selectbox("Select Faculty", id_options, key="admin_toggle_sel")
+        toggle_fid = toggle_sel.split(" — ")[0]
+        cur_admin  = _load_pw_store().get(toggle_fid, {}).get("is_admin", False)
+        st.info(f"**{id_name_map.get(toggle_fid, toggle_fid)}** (ID: {toggle_fid}) is currently: "
+                f"{'👑 Admin' if cur_admin else 'Regular Faculty'}")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button("Grant Admin", disabled=cur_admin, use_container_width=True):
+                pw_ensure(toggle_fid)
+                pw_set_admin(toggle_fid, True)
+                st.success(f"Admin rights granted to {id_name_map.get(toggle_fid, toggle_fid)}.")
+                st.rerun()
+        with col_b:
+            if st.button("Revoke Admin", disabled=not cur_admin, use_container_width=True):
+                pw_set_admin(toggle_fid, False)
+                st.success(f"Admin rights revoked from {id_name_map.get(toggle_fid, toggle_fid)}.")
+                st.rerun()
+
+        st.markdown("---")
+        st.markdown("#### 🔒 Change My Admin Password")
+        with st.expander("Change Admin Password"):
+            op  = st.text_input("Current Password", type="password", key="adm_op")
+            np1 = st.text_input("New Password", type="password", key="adm_np1")
+            np2 = st.text_input("Confirm New Password", type="password", key="adm_np2")
+            if st.button("Update Admin Password", key="adm_upd_pw"):
+                entry = pw_get(st.session_state.faculty_id)
+                if not entry or not verify_password(op, entry["password_hash"]):
+                    st.error("Current password is incorrect.")
+                elif len(np1) < 6:
+                    st.error("Password must be at least 6 characters.")
+                elif np1 != np2:
+                    st.error("Passwords do not match.")
+                else:
+                    pw_update(st.session_state.faculty_id, hash_password(np1))
+                    st.success("Admin password updated successfully.")
+
+    # ── Tab 5: Portal Settings ──────────────────────────────────── #
+    with t5:
+        st.markdown("### ⚙️ Portal Settings")
+        st.markdown("---")
+        st.markdown("#### 🔒 Allotment View — User Access Control")
+        is_open = gate_is_open()
+        if is_open:
             st.markdown(
-                "Set which semester is displayed in the portal banner and allotment views. "
-                "**Auto-detect** uses the exam slot dates (recommended). "
-                "Use manual override only if the auto-detection is incorrect.")
-            _sem_options = [
-                "Auto-detect",
-                "Even Semester (Apr/May End-Semester)",
-                "Odd Semester (Nov/Dec End-Semester)",
-            ]
-            _cur_sem = st.session_state.get("semester_override", "Auto-detect")
-            _new_sem = st.selectbox(
-                "Semester Display Mode",
-                _sem_options,
-                index=_sem_options.index(_cur_sem) if _cur_sem in _sem_options else 0,
-                key="sem_select"
-            )
-            if _new_sem != _cur_sem:
-                st.session_state["semester_override"] = _new_sem
-                st.success(f"Semester set to: **{_new_sem}**")
-                st.rerun()
+                "<div style='background:#d1fae5;border:1.5px solid #6ee7b7;"
+                "border-radius:10px;padding:12px 18px;margin-bottom:14px'>"
+                "<span style='font-size:1.05rem;font-weight:700;color:#065f46'>"
+                "🟢  Allotment view is ENABLED — faculty can see their allotment.</span>"
+                "</div>", unsafe_allow_html=True)
+        else:
+            st.markdown(
+                "<div style='background:#fee2e2;border:1.5px solid #fca5a5;"
+                "border-radius:10px;padding:12px 18px;margin-bottom:14px'>"
+                "<span style='font-size:1.05rem;font-weight:700;color:#991b1b'>"
+                "🔴  Allotment view is DISABLED — faculty see a waiting message.</span>"
+                "</div>", unsafe_allow_html=True)
+        en_col, dis_col = st.columns(2)
+        with en_col:
+            if st.button("✅ Enable Allotment View", use_container_width=True,
+                         disabled=is_open, type="primary"):
+                set_gate(True); st.success("Enabled."); st.rerun()
+        with dis_col:
+            if st.button("🔴 Disable Allotment View", use_container_width=True,
+                         disabled=not is_open):
+                set_gate(False); st.warning("Disabled."); st.rerun()
+        st.caption("Workflow: Disable → Run Optimizer → Review → Enable.")
 
-            _preview_slots = parse_duty_file(OFFLINE_FILE, "Offline") + parse_duty_file(ONLINE_FILE, "Online")
-            _preview_dates = {s["date"] for s in _preview_slots}
-            st.caption(
-                f"🔍 Currently showing: **{detect_semester(_preview_dates)}**  "
-                f"(Auto-detect reads exam slot months)")
-
-            st.markdown("---")
-            st.markdown("#### 🔐 Admin Session")
-            if st.button("🔒 Lock Admin View", use_container_width=True):
-                st.session_state.admin_authenticated = False
-                st.rerun()
-
-    st.markdown("---")
-    st.caption("Curated by Dr. N. Sathiya Narayanan | School of Mechanical Engineering")
-    st.stop()
+        st.markdown("---")
+        st.markdown("#### 🗓️ Semester Setting")
+        _sem_options = [
+            "Auto-detect",
+            "Even Semester (Apr/May End-Semester)",
+            "Odd Semester (Nov/Dec End-Semester)",
+        ]
+        _cur_sem = st.session_state.get("semester_override", "Auto-detect")
+        _new_sem = st.selectbox(
+            "Semester Display Mode", _sem_options,
+            index=_sem_options.index(_cur_sem) if _cur_sem in _sem_options else 0,
+            key="sem_select")
+        if _new_sem != _cur_sem:
+            st.session_state["semester_override"] = _new_sem
+            st.success(f"Semester set to: **{_new_sem}**"); st.rerun()
+        _pslots = (parse_duty_file(OFFLINE_FILE, "Offline") +
+                   parse_duty_file(ONLINE_FILE, "Online"))
+        st.caption(f"Currently showing: **{detect_semester({s['date'] for s in _pslots})}**")
 
 
 # ═══════════════════════════════════════════════════════════════ #
-#                        USER VIEW                               #
+#             ALLOTMENT VIEW (faculty self-service)              #
 # ═══════════════════════════════════════════════════════════════ #
-user_mode = st.radio("User View", ["Willingness", "Allotment"],
-                     horizontal=True, key="user_panel_mode")
-
-
-# ─── ALLOTMENT VIEW ──────────────────────────────────────────── #
-if user_mode == "Allotment":
+def page_allotment(fac_df, sel_name, sel_clean, frow):
     st.markdown("### My Allotment Details")
 
-    # Exam period + semester banner
-    _aslots = parse_duty_file(OFFLINE_FILE, "Offline") + parse_duty_file(ONLINE_FILE, "Online")
+    _aslots      = parse_duty_file(OFFLINE_FILE, "Offline") + parse_duty_file(ONLINE_FILE, "Online")
     _aslot_dates = {s["date"] for s in _aslots}
-    _asem = detect_semester(_aslot_dates)
-    _as, _ae = get_exam_period(_aslot_dates)
+    _asem        = detect_semester(_aslot_dates)
+    _as, _ae     = get_exam_period(_aslot_dates)
     if _as and _ae:
         st.markdown(
             f"<div style='background:#e0f2fe;border:1.5px solid #38bdf8;border-radius:10px;"
@@ -1910,9 +2329,7 @@ if user_mode == "Allotment":
             f"🎓 <b>{_asem}</b>&nbsp;&nbsp;|&nbsp;&nbsp; 📅 Exam Period: "
             f"<b>{_as.strftime('%d-%m-%Y')} ({_as.strftime('%A')})</b>"
             f" → <b>{_ae.strftime('%d-%m-%Y')} ({_ae.strftime('%A')})</b>"
-            f"</div>",
-            unsafe_allow_html=True
-        )
+            f"</div>", unsafe_allow_html=True)
 
     if not gate_is_open():
         st.markdown(
@@ -1925,45 +2342,48 @@ if user_mode == "Allotment":
             "The Examination Committee is reviewing the final allocation. "
             "Please check back shortly.</div>"
             "</div>", unsafe_allow_html=True)
-        st.markdown("---")
-        st.caption("Curated by Dr. N. Sathiya Narayanan | School of Mechanical Engineering")
-        st.stop()
+        return
 
-    fnames = fac_df["Name"].dropna().drop_duplicates().tolist()
-    sn = st.selectbox("Select Your Name", fnames, key="aname")
-    sc = clean(sn)
-    frd = fac_df[fac_df["Clean"] == sc]
+    vd = [f"{fmt_day(d.strftime('%d-%m-%Y'))} - Full Day" for d in valuation_dates_for(frow)]
+    qd = [fmt_day(d) for d in qp_dates_for(frow)]
 
-    vd, qd = [], []
-    if not frd.empty:
-        fr2 = frd.iloc[0]
-        vd = [f"{fmt_day(d.strftime('%d-%m-%Y'))} - Full Day" for d in valuation_dates_for(fr2)]
-        qd = [fmt_day(d) for d in qp_dates_for(fr2)]
-
-    wd2 = load_willingness()
+    wd2   = load_willingness()
     wdisp = []
+    will_pairs: set = set()
     if not wd2.empty:
-        wm = fac_mask(wd2, sc)
-        wr = wd2[wm]
+        wm = fac_mask(wd2, sel_clean); wr = wd2[wm]
         if not wr.empty and {"Date", "Session"}.issubset(wr.columns):
             for d2, s2 in zip(wr["Date"], wr["Session"]):
-                wdisp.append(f"{fmt_day(d2)} - {str(s2).upper()}")
+                nd = pd.to_datetime(d2, dayfirst=True, errors="coerce")
+                if pd.notna(nd):
+                    wdisp.append(f"{fmt_day(d2)} - {str(s2).upper()}")
+                    will_pairs.add((nd.date(), str(s2).upper()))
 
-    adf = pd.read_excel(FINAL_ALLOC_FILE) if os.path.exists(FINAL_ALLOC_FILE) else pd.DataFrame()
+    adf   = pd.read_excel(FINAL_ALLOC_FILE) if os.path.exists(FINAL_ALLOC_FILE) else pd.DataFrame()
     idisp = []
+    allot_pairs: set = set()
     if not adf.empty:
-        am = fac_mask(adf, sc)
-        allot_rows = adf[am].copy()
-        if not allot_rows.empty and {"Date", "Session"}.issubset(allot_rows.columns):
-            for _, ar in allot_rows.iterrows():
-                dtype    = str(ar.get("Type", "")).strip()
-                raw_date = ar["Date"]
+        am = fac_mask(adf, sel_clean); ar2 = adf[am]
+        if not ar2.empty and {"Date", "Session"}.issubset(ar2.columns):
+            for _, ar in ar2.iterrows():
+                dtype   = str(ar.get("Type", "")).strip()
+                raw_d   = ar["Date"]
+                sat_tag = ""
                 try:
-                    dt_obj   = pd.to_datetime(raw_date, dayfirst=True)
-                    sat_tag  = " — Saturday" if dt_obj.weekday() == 5 else ""
-                except Exception:
-                    sat_tag  = ""
-                idisp.append(f"{fmt_day(raw_date)} - {str(ar['Session']).upper()} ({dtype}){sat_tag}")
+                    if pd.to_datetime(raw_d, dayfirst=True).weekday() == 5:
+                        sat_tag = " — Saturday"
+                except: pass
+                idisp.append(f"{fmt_day(raw_d)} - {str(ar['Session']).upper()} ({dtype}){sat_tag}")
+                nd2 = pd.to_datetime(raw_d, dayfirst=True, errors="coerce")
+                if pd.notna(nd2):
+                    allot_pairs.add((nd2.date(), str(ar["Session"]).upper()))
+
+    # Willingness accommodation percentage
+    if will_pairs:
+        matched = len(will_pairs & allot_pairs)
+        acc_pct = f"{matched/len(will_pairs)*100:.1f}%  ({matched}/{len(will_pairs)})"
+    else:
+        acc_pct = "Not available"
 
     c1, c2 = st.columns(2)
     with c1:
@@ -1971,7 +2391,6 @@ if user_mode == "Allotment":
                     unsafe_allow_html=True)
         st.dataframe(pd.DataFrame({"Date & Session": wdisp or ["Not submitted"]}),
                      use_container_width=True, hide_index=True)
-
         st.markdown('<div class="panel"><div class="sec-title">🏛️ IG Duty Allotment</div></div>',
                     unsafe_allow_html=True)
         st.dataframe(pd.DataFrame({"Date, Session & Type": idisp or ["Not allotted yet"]}),
@@ -1981,28 +2400,30 @@ if user_mode == "Allotment":
                     unsafe_allow_html=True)
         st.dataframe(pd.DataFrame({"Date": vd or ["Not available"]}),
                      use_container_width=True, hide_index=True)
-
         st.markdown('<div class="panel"><div class="sec-title">💬 QP Feedback Dates</div></div>',
                     unsafe_allow_html=True)
         st.dataframe(pd.DataFrame({"Date": qd or ["Not available"]}),
                      use_container_width=True, hide_index=True)
 
+    # Accommodation stat banner
+    st.markdown(
+        f"<div style='margin-top:10px;padding:12px 16px;background:#f0fdf4;"
+        f"border:1.5px solid #86efac;border-radius:10px;font-size:.9rem;color:#166534'>"
+        f"📊 <b>Willingness Accommodation:</b> {acc_pct}</div>",
+        unsafe_allow_html=True)
+
     st.markdown(
         "<div style='margin-top:10px;padding:10px 14px;background:#f1f5f9;"
         "border-radius:8px;border:1px solid #cbd5e1;font-size:.82rem;color:#475569'>"
-        "📩 For any specific support or clarification regarding your duty allotment, "
-        "please contact the <strong>University Examination Committee, "
-        "School of Mechanical Engineering (SoME)</strong>."
-        "</div>",
-        unsafe_allow_html=True
-    )
+        "📩 For support or clarification, contact the "
+        "<strong>University Examination Committee, SoME</strong>.</div>",
+        unsafe_allow_html=True)
 
-    msg = build_msg(sn, wdisp, vd, idisp, qd)
+    msg = build_msg(sel_name, wdisp, vd, idisp, qd)
     st.markdown('<div class="panel"><div class="sec-title">📲 Share via WhatsApp</div></div>',
                 unsafe_allow_html=True)
     st.markdown("**Message Preview:**")
     st.code(msg, language="text")
-
     wph = st.text_input("WhatsApp Number (with country code)", placeholder="+919876543210")
     if wph.strip():
         lnk = wa_link(wph.strip(), msg)
@@ -2010,87 +2431,70 @@ if user_mode == "Allotment":
             f'<a href="{lnk}" target="_blank" style="display:inline-block;'
             f'background:#25D366;color:white;padding:10px 22px;border-radius:10px;'
             f'font-weight:700;text-decoration:none;margin-top:6px">'
-            f'📲 Open WhatsApp &amp; Send</a>',
-            unsafe_allow_html=True)
+            f'📲 Open WhatsApp &amp; Send</a>', unsafe_allow_html=True)
     else:
         st.caption("Enter your WhatsApp number above to generate the send link.")
 
-    st.markdown("---")
-    st.caption("Curated by Dr. N. Sathiya Narayanan | School of Mechanical Engineering")
-    st.stop()
 
+# ═══════════════════════════════════════════════════════════════ #
+#             WILLINGNESS SUBMISSION PAGE                        #
+# ═══════════════════════════════════════════════════════════════ #
+def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
+    sel_clean = clean(sel_name)
+    desig2    = str(frow["Designation"]).strip().upper()
+    req_cnt   = DUTY_STRUCTURE.get(desig2, 0)
+    val_d2    = valuation_dates_for(frow)
+    val_s2    = set(val_d2)
 
-# ─── WILLINGNESS SUBMISSION ───────────────────────────────────── #
-fnames2   = fac_df["Name"].dropna().drop_duplicates().tolist()
+    if req_cnt == 0:
+        st.warning(f"Designation '{desig2}' not recognised. Contact admin.")
+        return
 
-# ── Exam period + semester banner ──────────────────────────────
-_all_slots_user = parse_duty_file(OFFLINE_FILE, "Offline") + parse_duty_file(ONLINE_FILE, "Online")
-_slot_dates_user = {s["date"] for s in _all_slots_user}
-_sem_label = detect_semester(_slot_dates_user)
-_exam_start, _exam_end = get_exam_period(_slot_dates_user)
+    sopts = online_df.copy() if desig2 == "P" else offline_df.copy()
+    sopts["Date"]     = pd.to_datetime(sopts["Date"], errors="coerce")
+    sopts["DateOnly"] = sopts["Date"].dt.date
+    valid_d = sorted([d for d in sopts["DateOnly"].dropna().unique() if d not in val_s2])
 
-_period_str = ""
-if _exam_start and _exam_end:
-    _period_str = (
-        f"&nbsp;&nbsp;|&nbsp;&nbsp; 📅 Exam Period: "
-        f"<b>{_exam_start.strftime('%d-%m-%Y')} ({_exam_start.strftime('%A')})</b>"
-        f" → <b>{_exam_end.strftime('%d-%m-%Y')} ({_exam_end.strftime('%A')})</b>"
-    )
+    if st.session_state.selected_faculty != sel_clean:
+        st.session_state.selected_faculty = sel_clean
+        st.session_state.selected_slots   = []
+        st.session_state["picked_date"]   = valid_d[0] if valid_d else None
 
-st.markdown(
-    f"<div style='background:#e0f2fe;border:1.5px solid #38bdf8;border-radius:10px;"
-    f"padding:10px 16px;margin-bottom:4px;font-size:.93rem;color:#0c4a6e'>"
-    f"🎓 <b>{_sem_label}</b>{_period_str}"
-    f"</div>",
-    unsafe_allow_html=True
-)
+    if "picked_date" not in st.session_state:
+        st.session_state["picked_date"] = valid_d[0] if valid_d else None
 
+    # Show exam period banner
+    _all_slots_user  = parse_duty_file(OFFLINE_FILE, "Offline") + parse_duty_file(ONLINE_FILE, "Online")
+    _slot_dates_user = {s["date"] for s in _all_slots_user}
+    _sem_label       = detect_semester(_slot_dates_user)
+    _exam_start, _exam_end = get_exam_period(_slot_dates_user)
 
+    _period_str = ""
+    if _exam_start and _exam_end:
+        _period_str = (
+            f"&nbsp;&nbsp;|&nbsp;&nbsp; 📅 Exam Period: "
+            f"<b>{_exam_start.strftime('%d-%m-%Y')} ({_exam_start.strftime('%A')})</b>"
+            f" → <b>{_exam_end.strftime('%d-%m-%Y')} ({_exam_end.strftime('%A')})</b>")
 
-sel_name  = st.selectbox("Select Your Name", fnames2)
-sel_clean = clean(sel_name)
-fmatch    = fac_df[fac_df["Clean"] == sel_clean]
+    st.markdown(
+        f"<div style='background:#e0f2fe;border:1.5px solid #38bdf8;border-radius:10px;"
+        f"padding:10px 16px;margin-bottom:4px;font-size:.93rem;color:#0c4a6e'>"
+        f"🎓 <b>{_sem_label}</b>{_period_str}</div>", unsafe_allow_html=True)
 
-if fmatch.empty:
-    st.error("Faculty not found. Contact admin.")
-    st.stop()
+    left, right = st.columns([1, 1.4])
 
-frow2   = fmatch.iloc[0]
-desig2  = str(frow2["Designation"]).strip().upper()
-req_cnt = DUTY_STRUCTURE.get(desig2, 0)
-val_d2  = valuation_dates_for(frow2)
-val_s2  = set(val_d2)
+    with left:
+        st.subheader("Willingness Submission")
+        st.write(f"**Designation:** {DESIG_FULL.get(desig2, desig2)}")
+        duties_min, duties_max = DESIG_RULES.get(desig2, (0, 0, []))[:2]
+        duties_label = str(duties_min) if duties_min == duties_max else f"{duties_min}–{duties_max}"
+        st.write(f"**Duties to be Allotted:** {duties_label}")
+        st.write(f"**Options to Select:** {req_cnt}")
 
-if req_cnt == 0:
-    st.warning(f"Designation '{desig2}' not recognised. Contact admin.")
-
-sopts = online_df.copy() if desig2 == "P" else offline_df.copy()
-sopts["Date"]     = pd.to_datetime(sopts["Date"], errors="coerce")
-sopts["DateOnly"] = sopts["Date"].dt.date
-valid_d = sorted([d for d in sopts["DateOnly"].dropna().unique() if d not in val_s2])
-
-if st.session_state.selected_faculty != sel_clean:
-    st.session_state.selected_faculty = sel_clean
-    st.session_state.selected_slots   = []
-    st.session_state["picked_date"]   = valid_d[0] if valid_d else None
-
-if "picked_date" not in st.session_state:
-    st.session_state["picked_date"] = valid_d[0] if valid_d else None
-
-left, right = st.columns([1, 1.4])
-
-with left:
-    st.subheader("Willingness Submission")
-    st.write(f"**Designation:** {DESIG_FULL.get(desig2, desig2)}")
-    duties_min, duties_max = DESIG_RULES.get(desig2, (0, 0, []))[:2]
-    duties_label = str(duties_min) if duties_min == duties_max else f"{duties_min}–{duties_max}"
-    st.write(f"**Duties to be Allotted:** {duties_label}")
-    st.write(f"**Options to Select:** {req_cnt}")
-
-    st.markdown("""
+        st.markdown("""
 <div style="background:#f0f7ff;border:1.5px solid #93c5fd;border-radius:12px;
             padding:14px 16px;margin:8px 0 14px 0">
-  <div style="font-size:.88rem;font-weight:800;color:#1e3a5f;margin-bottom:8px;">
+  <div style="font-size:.88rem;font-weight:800;color:#1e3a5f;margin-bottom:8px">
     ℹ️ How Your Duty Will Be Allotted
   </div>
   <table style="width:100%;margin-top:8px;border-collapse:collapse;font-size:.81rem">
@@ -2124,114 +2528,266 @@ with left:
     💡 Submit dates spread across the exam period to maximise your match rate.
     Valuation dates are automatically protected.
   </div>
-</div>
-""", unsafe_allow_html=True)
+</div>""", unsafe_allow_html=True)
 
-    if desig2 == "ACP":
-        st.info(
-            "ACP faculty will receive one Online and one Offline duty. "
-            "Please select all available dates from the Offline calendar. "
-            "Online duty will be assigned automatically from your submitted dates.")
+        if desig2 == "ACP":
+            st.info("ACP faculty will receive one Online and one Offline duty. "
+                    "Please select all available dates from the Offline calendar. "
+                    "Online duty will be assigned automatically from your submitted dates.")
 
-    if not valid_d:
-        st.warning("No dates available for selection.")
+        if not valid_d:
+            st.warning("No dates available for selection.")
+        else:
+            picked = st.selectbox(
+                "Choose Online Date" if desig2 == "P" else "Choose Offline Date",
+                valid_d, key="picked_date",
+                format_func=lambda d: d.strftime("%d-%m-%Y (%A)"))
+            avail = set(sopts[sopts["DateOnly"] == picked]["Session"]
+                        .dropna().astype(str).str.upper())
+
+            all_will_now   = get_all_willingness()
+            any_prob_shown = False
+            for sess_opt in ["FN", "AN"]:
+                if sess_opt in avail:
+                    prob_info = slot_probability(all_will_now, sopts, picked, sess_opt)
+                    if prob_info["seats"] > 0:
+                        render_prob_bar(prob_info, sess_opt)
+                        any_prob_shown = True
+            if any_prob_shown:
+                st.caption("⚡ Probability = available seats ÷ total applicants for that session.")
+
+            b1, b2 = st.columns(2)
+            with b1:
+                add_fn = st.button(
+                    "➕ Add FN", use_container_width=True,
+                    disabled=("FN" not in avail or
+                              len(st.session_state.selected_slots) >= req_cnt))
+            with b2:
+                add_an = st.button(
+                    "➕ Add AN", use_container_width=True,
+                    disabled=("AN" not in avail or
+                              len(st.session_state.selected_slots) >= req_cnt))
+
+            def add_slot(sess):
+                exist = {s["Date"] for s in st.session_state.selected_slots}
+                sl2   = {"Date": picked, "Session": sess}
+                if picked in val_s2:
+                    st.warning("Valuation date — cannot select.")
+                elif picked in exist:
+                    st.warning("Both FN and AN on same date not allowed.")
+                elif len(st.session_state.selected_slots) >= req_cnt:
+                    st.warning("Count reached.")
+                elif sl2 in st.session_state.selected_slots:
+                    st.warning("Already selected.")
+                else:
+                    st.session_state.selected_slots.append(sl2)
+
+            if add_fn: add_slot("FN")
+            if add_an: add_slot("AN")
+
+        st.session_state.selected_slots = st.session_state.selected_slots[:req_cnt]
+        st.write(f"**Selected:** {len(st.session_state.selected_slots)} / {req_cnt}")
+
+        sdf = pd.DataFrame(st.session_state.selected_slots)
+        if not sdf.empty:
+            sdf = sdf.sort_values(["Date", "Session"]).reset_index(drop=True)
+            sdf.insert(0, "Sl.No", sdf.index + 1)
+            sdf["Day"]  = pd.to_datetime(sdf["Date"]).dt.day_name()
+            sdf["Date"] = pd.to_datetime(sdf["Date"]).dt.strftime("%d-%m-%Y")
+            st.dataframe(sdf[["Sl.No", "Date", "Day", "Session"]],
+                         use_container_width=True, hide_index=True)
+            rm = st.selectbox("Sl.No to remove", options=sdf["Sl.No"].tolist())
+            if st.button("🗑 Remove Row", use_container_width=True):
+                tgt = sdf[sdf["Sl.No"] == rm].iloc[0]
+                td  = pd.to_datetime(tgt["Date"], dayfirst=True).date()
+                ts  = tgt["Session"]
+                st.session_state.selected_slots = [
+                    s for s in st.session_state.selected_slots
+                    if not (s["Date"] == td and s["Session"] == ts)]
+                st.rerun()
+
+        is_already = already_submitted(sel_name)
+        st.markdown("### Submit Willingness")
+        rem2 = max(req_cnt - len(st.session_state.selected_slots), 0)
+
+        if is_already:
+            st.warning("⚠ You have already submitted. Submitting again will **replace** your previous choices.")
+        if rem2 == 0 and req_cnt > 0:
+            st.success(f"✅ All {req_cnt} options selected. Ready to submit.")
+        elif not is_already:
+            st.info(f"Select {rem2} more option(s) to enable submission.")
+
+        if st.button("✅ Submit Willingness",
+                     disabled=(len(st.session_state.selected_slots) != req_cnt),
+                     use_container_width=True):
+            save_submission(sel_name, st.session_state.selected_slots)
+            st.session_state.selected_slots = []
+            action = "re-submitted" if is_already else "submitted"
+            st.toast(f"Willingness {action} successfully! ✅", icon="✅")
+            st.success(
+                "Thank you for submitting. The final duty allocation will be carried out "
+                "using MILP optimization. Check this portal for allotment updates.")
+
+    with right:
+        if desig2 == "P":
+            render_calendar(online_df, val_s2, "Online Duty Calendar")
+        else:
+            render_calendar(offline_df, val_s2, "Offline Duty Calendar")
+
+
+# ═══════════════════════════════════════════════════════════════ #
+#                         MAIN ROUTER                            #
+# ═══════════════════════════════════════════════════════════════ #
+def main():
+    # ── 1. Load faculty data (required before login) ─────────────
+    if not os.path.exists(FACULTY_FILE):
+        render_header(logo=True)
+        st.error(f"**{FACULTY_FILE}** not found. Place it in the same folder as app.py.")
+        st.stop()
+
+    fac_df = pd.read_excel(FACULTY_FILE)
+    fac_df.columns = fac_df.columns.str.strip()
+
+    # ── Flexible column detection ─────────────────────────────────
+    # Normalise column names for comparison (strip, upper, remove dots/spaces/underscores)
+    def _norm_col(c): return str(c).strip().upper().replace(".", "").replace(" ", "").replace("_", "")
+    col_map = {_norm_col(c): c for c in fac_df.columns}
+
+    # ID column: prefer "ID No." / "ID Num" over plain "ID" to avoid matching S.No. siblings
+    id_col = (
+        col_map.get("IDNO")          # "ID No." → "IDNO"
+        or col_map.get("IDNUM")      # "ID Num"
+        or col_map.get("IDNUMBER")   # "ID Number"
+        or col_map.get("FACULTYID")  # "Faculty ID"
+        # Plain "ID" only as last resort — guard against S.No. or other short cols
+        or (col_map.get("ID") if col_map.get("ID") and
+            _norm_col(col_map.get("ID")) not in ("SNO", "SLNO", "SRNO") else None)
+    )
+    name_col = (
+        col_map.get("NAMEOFSTAFF")   # "NAME OF STAFF"
+        or col_map.get("STAFFNAME")  # "STAFF NAME"
+        or col_map.get("FACULTYNAME")# "FACULTY NAME"
+        or col_map.get("NAME")       # plain "NAME"
+    )
+    desig_col = (
+        col_map.get("DESIGNATION")
+        or col_map.get("DESIG")
+        or col_map.get("POST")
+    )
+
+    if id_col and name_col:
+        # New format: has ID No. and NAME OF STAFF columns
+        rename_map = {id_col: "ID No.", name_col: "Name"}
+        if desig_col and desig_col not in rename_map:
+            rename_map[desig_col] = "Designation"
+        fac_df = fac_df.rename(columns=rename_map)
+        fac_df["ID No."] = (
+            fac_df["ID No."].astype(str).str.strip().str.upper()
+            .str.replace(" ", "", regex=False)
+        )
+        # Drop rows where ID No. is blank / NaN / 'NAN'
+        fac_df = fac_df[~fac_df["ID No."].isin(["", "NAN", "NONE"])].copy()
     else:
-        picked = st.selectbox(
-            "Choose Online Date" if desig2 == "P" else "Choose Offline Date",
-            valid_d, key="picked_date",
-            format_func=lambda d: d.strftime("%d-%m-%Y (%A)"))
-        avail = set(sopts[sopts["DateOnly"] == picked]["Session"].dropna().astype(str).str.upper())
+        # Legacy format — use row position as synthetic ID
+        cols = fac_df.columns.tolist()
+        fac_df.rename(columns={cols[0]: "Name", cols[1]: "Designation"}, inplace=True)
+        fac_df["ID No."] = ["FAC" + str(i+1).zfill(3) for i in range(len(fac_df))]
+        st.warning(
+            "⚠ Faculty_Master.xlsx does not have an 'ID No.' column. "
+            "Faculty cannot log in by ID. Please use the file with columns: "
+            "Name | ID No. | Designation", icon="⚠️")
 
-        all_will_now = get_all_willingness()
-        any_prob_shown = False
-        for sess_opt in ["FN", "AN"]:
-            if sess_opt in avail:
-                prob_info = slot_probability(all_will_now, sopts, picked, sess_opt)
-                seats_val = prob_info["seats"]
-                appl_val  = prob_info["applicants"]
-                if seats_val > 0 and appl_val >= 3 * seats_val:
-                    render_prob_bar(prob_info, sess_opt)
-                    any_prob_shown = True
-        if any_prob_shown:
-            st.caption("⚡ Probability shown when demand is 3× or more than available seats.")
+    fac_df = fac_df.dropna(subset=["Name"]).reset_index(drop=True)
+    fac_df["Name"]  = fac_df["Name"].astype(str).str.strip()
+    fac_df["Clean"] = fac_df["Name"].apply(clean)
 
-        b1, b2 = st.columns(2)
-        with b1:
-            add_fn = st.button("➕ Add FN", use_container_width=True,
-                disabled=("FN" not in avail or len(st.session_state.selected_slots) >= req_cnt))
-        with b2:
-            add_an = st.button("➕ Add AN", use_container_width=True,
-                disabled=("AN" not in avail or len(st.session_state.selected_slots) >= req_cnt))
+    # Normalise designation strings → internal codes (P, ACP, SAP, AP3, AP2, TA, RA)
+    fac_df["Designation"] = (
+        fac_df["Designation"].astype(str).str.strip()
+        .apply(lambda x: DESIG_MAP.get(x.lower(), x.upper()))
+    )
 
-        def add_slot(sess):
-            exist = {s["Date"] for s in st.session_state.selected_slots}
-            sl2   = {"Date": picked, "Session": sess}
-            if picked in val_s2:
-                st.warning("Valuation date — cannot select.")
-            elif picked in exist:
-                st.warning("Both FN and AN on same date not allowed.")
-            elif len(st.session_state.selected_slots) >= req_cnt:
-                st.warning("Count reached.")
-            elif sl2 in st.session_state.selected_slots:
-                st.warning("Already selected.")
-            else:
-                st.session_state.selected_slots.append(sl2)
+    # ── Proactively create password entries for all known faculty IDs ──
+    # This ensures every faculty in the master list can log in immediately
+    # without waiting for their first attempted login.
+    if "ID No." in fac_df.columns:
+        pw_ensure_all(fac_df["ID No."].dropna().tolist())
 
-        if add_fn: add_slot("FN")
-        if add_an: add_slot("AN")
+    offline_df, online_df = load_slots(OFFLINE_FILE, ONLINE_FILE)
 
-    st.session_state.selected_slots = st.session_state.selected_slots[:req_cnt]
-    st.write(f"**Selected:** {len(st.session_state.selected_slots)} / {req_cnt}")
+    # ── 2. Login gate ─────────────────────────────────────────────
+    if not st.session_state.logged_in:
+        page_login(fac_df)
+        return  # st.stop() inside page_login
 
-    sdf = pd.DataFrame(st.session_state.selected_slots)
-    if not sdf.empty:
-        sdf = sdf.sort_values(["Date", "Session"]).reset_index(drop=True)
-        sdf.insert(0, "Sl.No", sdf.index + 1)
-        sdf["Day"]  = pd.to_datetime(sdf["Date"]).dt.day_name()
-        sdf["Date"] = pd.to_datetime(sdf["Date"]).dt.strftime("%d-%m-%Y")
-        st.dataframe(sdf[["Sl.No", "Date", "Day", "Session"]], use_container_width=True, hide_index=True)
-        rm = st.selectbox("Sl.No to remove", options=sdf["Sl.No"].tolist())
-        if st.button("🗑 Remove Row", use_container_width=True):
-            tgt = sdf[sdf["Sl.No"] == rm].iloc[0]
-            td  = pd.to_datetime(tgt["Date"], dayfirst=True).date()
-            ts  = tgt["Session"]
-            st.session_state.selected_slots = [
-                s for s in st.session_state.selected_slots
-                if not (s["Date"] == td and s["Session"] == ts)]
+    # ── 3. Force password change ──────────────────────────────────
+    if st.session_state.must_change_pw:
+        page_force_change_password()
+        return
+
+    # ── 4. Header + notice banner ─────────────────────────────────
+    render_header(logo=False)
+    st.markdown(
+        "<div class='blink'><strong>Note:</strong> The University Examination Committee "
+        "sincerely appreciates your cooperation. Every effort will be made to accommodate "
+        "your willingness. Final duty allocation is carried out using AI-assisted MILP "
+        "optimization.</div>", unsafe_allow_html=True)
+    st.markdown("")
+
+    # ── 5. Welcome row + logout ───────────────────────────────────
+    col_title, col_logout = st.columns([6, 1])
+    with col_logout:
+        if st.button("🚪 Logout"):
+            for k in ["logged_in", "faculty_id", "faculty_name", "faculty_clean",
+                      "is_admin", "must_change_pw", "selected_slots", "selected_faculty"]:
+                st.session_state[k] = (
+                    [] if k == "selected_slots"
+                    else (False if k not in ("faculty_id", "faculty_name", "faculty_clean") else ""))
             st.rerun()
+    with col_title:
+        fid_disp  = st.session_state.faculty_id
+        name_disp = st.session_state.faculty_name
+        is_admin  = st.session_state.is_admin
+        badge     = " 👑 Admin" if is_admin else ""
+        st.markdown(
+            f"**Welcome, {name_disp}** &nbsp; <span style='color:#64748b;font-size:.88rem'>"
+            f"({fid_disp})</span>{badge}",
+            unsafe_allow_html=True)
 
-    wl2 = load_willingness()
-    already = (sel_clean in wl2["FacultyClean"].tolist()
-               if not wl2.empty and "FacultyClean" in wl2.columns else False)
-    pend = st.session_state.get("pending_submissions", pd.DataFrame(columns=["Faculty", "Date", "Session"]))
-    if not pend.empty and "Faculty" in pend.columns:
-        already = already or (sel_name in pend["Faculty"].tolist())
+    # ── 6. Main panel routing ─────────────────────────────────────
+    if is_admin:
+        menu = st.radio("Main Menu", ["User View", "Admin View"],
+                        horizontal=True, key="panel_mode")
+        if menu == "Admin View":
+            page_admin(fac_df, offline_df, online_df)
+            st.markdown("---")
+            st.caption("Curated by Dr. N. Sathiya Narayanan | School of Mechanical Engineering")
+            return
 
-    st.markdown("### Submit Willingness")
-    rem2 = max(req_cnt - len(st.session_state.selected_slots), 0)
+    # ── 7. User view panel ────────────────────────────────────────
+    sub = st.radio("View", ["Willingness", "My Allotment", "Change Password"],
+                   horizontal=True, key="user_panel_mode")
 
-    if already:
-        st.warning("⚠ You have already submitted your willingness.")
-    elif rem2 == 0 and req_cnt > 0:
-        st.success(f"✅ All {req_cnt} options selected. Ready to submit.")
+    # Identify current faculty's row in the master list
+    sel_name  = st.session_state.faculty_name
+    sel_clean = st.session_state.faculty_clean
+    fmatch    = fac_df[fac_df["Clean"] == sel_clean]
+
+    if fmatch.empty:
+        st.error("Your faculty record was not found in Faculty_Master.xlsx. Contact admin.")
+        st.stop()
+
+    frow = fmatch.iloc[0]
+
+    if sub == "My Allotment":
+        page_allotment(fac_df, sel_name, sel_clean, frow)
+    elif sub == "Change Password":
+        section_change_password()
     else:
-        st.info(f"Select {rem2} more option(s) to enable submission.")
+        page_willingness(fac_df, offline_df, online_df, sel_name, frow)
 
-    if st.button("✅ Submit Willingness",
-                 disabled=(already or len(st.session_state.selected_slots) != req_cnt),
-                 use_container_width=True):
-        save_submission(sel_name, st.session_state.selected_slots)
-        st.session_state.selected_slots = []
-        st.toast("Willingness submitted successfully! ✅", icon="✅")
-        st.success(
-            "Thank you for submitting. The final duty allocation will be carried out "
-            "using MILP optimization. Check this portal for allotment updates.")
+    st.markdown("---")
+    st.caption("Curated by Dr. N. Sathiya Narayanan | School of Mechanical Engineering")
 
-with right:
-    if desig2 == "P":
-        render_calendar(online_df, val_s2, "Online Duty Calendar")
-    else:
-        render_calendar(offline_df, val_s2, "Offline Duty Calendar")
 
-st.markdown("---")
-st.caption("Curated by Dr. N. Sathiya Narayanan | School of Mechanical Engineering")
+main()
