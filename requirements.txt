@@ -5,3 +5,4 @@ numpy
 bcrypt
 scipy
 altair
+supabase
