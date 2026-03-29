@@ -1,0 +1,9 @@
+faculty_passwords.json
+Faculty_Master.xlsx
+Offline_Duty.xlsx
+Online_Duty.xlsx
+Willingness*.xlsx
+Final_Allocation*.xlsx
+allotment_gate.txt
+__pycache__/
+*.pyc
