@@ -1,17 +1,18 @@
--- ============================================================
--- SASTRA SoME Duty Portal — Supabase Schema Setup
--- Run this entire script once in Supabase SQL Editor
--- ============================================================
+-- ================================================================
+-- SASTRA SoME Duty Portal — Supabase Schema
+-- Run this ONCE in Supabase → SQL Editor → New Query → Run
+-- ================================================================
 
--- 1. Faculty accounts (login + profile)
+-- 1. Faculty (login + profile + valuation dates)
 CREATE TABLE IF NOT EXISTS faculty (
     id              SERIAL PRIMARY KEY,
-    faculty_id      TEXT UNIQUE NOT NULL,        -- e.g. C870, RS602, C2086
+    faculty_id      TEXT UNIQUE NOT NULL,        -- e.g. C870, RS1051
     name            TEXT NOT NULL,
-    designation     TEXT NOT NULL,
+    designation     TEXT NOT NULL,               -- raw string from Excel e.g. "AP 3"
     email           TEXT,
-    password_hash   TEXT NOT NULL,               -- bcrypt hash
-    must_change_pw  BOOLEAN DEFAULT TRUE,        -- force change on first login
+    phone           TEXT,
+    password_hash   TEXT NOT NULL,
+    must_change_pw  BOOLEAN DEFAULT TRUE,
     is_admin        BOOLEAN DEFAULT FALSE,
     v1 DATE, v2 DATE, v3 DATE, v4 DATE, v5 DATE,
     qp_date_1 DATE, qp_date_2 DATE,
@@ -32,7 +33,7 @@ CREATE TABLE IF NOT EXISTS password_reset_tokens (
 CREATE TABLE IF NOT EXISTS offline_duty (
     id          SERIAL PRIMARY KEY,
     duty_date   DATE NOT NULL,
-    session     TEXT NOT NULL,
+    session     TEXT NOT NULL,   -- FN or AN
     required    INTEGER NOT NULL DEFAULT 1
 );
 
@@ -55,7 +56,7 @@ CREATE TABLE IF NOT EXISTS willingness (
     UNIQUE(faculty_id, duty_date, session)
 );
 
--- 6. Final allocation
+-- 6. Final allocation output
 CREATE TABLE IF NOT EXISTS final_allocation (
     id           SERIAL PRIMARY KEY,
     faculty_id   TEXT REFERENCES faculty(faculty_id) ON DELETE CASCADE,
@@ -63,12 +64,19 @@ CREATE TABLE IF NOT EXISTS final_allocation (
     designation  TEXT NOT NULL,
     duty_date    DATE NOT NULL,
     session      TEXT NOT NULL,
-    mode         TEXT NOT NULL,
-    allot_reason TEXT,
+    duty_type    TEXT NOT NULL,     -- Offline or Online
+    allocated_by TEXT,              -- Willingness-Exact, Auto-Assigned etc.
     allocated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- ============================================================
--- NOTE: Faculty IDs are taken directly from Faculty_Master.xlsx
--- (format: C870, RS602, C2086 etc.) — no ID generation needed.
--- ============================================================
+-- 7. Portal settings (gate open/closed, semester override etc.)
+CREATE TABLE IF NOT EXISTS portal_settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+-- Default settings
+INSERT INTO portal_settings (key, value)
+VALUES ('allotment_gate', '0'),
+       ('semester_override', 'Auto-detect')
+ON CONFLICT (key) DO NOTHING;
