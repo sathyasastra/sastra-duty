@@ -909,27 +909,16 @@ def _load_core(log):
     if not SCIPY_OK:
         raise RuntimeError("scipy not installed. Run:  pip install scipy")
 
-    fr = pd.read_excel(FACULTY_FILE)
-    fr.columns = fr.columns.str.strip()
-
-    # Flexible column detection (same logic as main)
-    def _nc(c): return str(c).strip().upper().replace(".", "").replace(" ", "").replace("_", "")
-    _cmap = {_nc(c): c for c in fr.columns}
-    _id_col   = _cmap.get("IDNO") or _cmap.get("IDNUM") or _cmap.get("ID")
-    _name_col = _cmap.get("NAMEOFSTAFF") or _cmap.get("NAME") or _cmap.get("FACULTYNAME")
-    if _id_col and _name_col:
-        fr = fr.rename(columns={_id_col: "ID No.", _name_col: "Name"})
-        fr["ID No."] = fr["ID No."].astype(str).str.strip().str.upper().str.replace(" ", "", regex=False)
-    else:
-        cols = fr.columns.tolist()
-        fr.rename(columns={cols[0]: "Name", cols[1]: "Designation"}, inplace=True)
-
+    # ── Load faculty from Supabase ────────────────────────────────
+    fac_rows = db_get_all_faculty()
+    if not fac_rows:
+        raise RuntimeError("No faculty found in Supabase.")
+    fr = pd.DataFrame(fac_rows)
+    fr["Name"]        = fr["name"].astype(str).str.strip()
+    fr["Designation"] = (fr["designation"].astype(str).str.strip()
+                         .apply(lambda x: DESIG_MAP.get(x.lower(), x.upper())))
+    fr["ID No."]      = fr["faculty_id"].astype(str).apply(_norm_id)
     fr = fr.dropna(subset=["Name"]).reset_index(drop=True)
-    fr["Name"]        = fr["Name"].astype(str).str.strip()
-    fr["Designation"] = (
-        fr["Designation"].astype(str).str.strip()
-        .apply(lambda x: DESIG_MAP.get(x.lower(), x.upper()))
-    )
 
     ALL_FAC = fr["Name"].tolist()
     FAC_IDX = {n: i for i, n in enumerate(ALL_FAC)}
@@ -940,17 +929,38 @@ def _load_core(log):
     for n, d in fac_d.items():
         dgroups[d].append(n)
 
+    # ── Valuation dates from Supabase (ISO format YYYY-MM-DD) ─────
     fac_val = {}
     for _, r in fr.iterrows():
         vd = set()
-        for c in ["V1","V2","V3","V4","V5"]:
-            if c in r.index and pd.notna(r[c]):
-                try: vd.add(pd.to_datetime(r[c], dayfirst=True).date())
-                except: pass
+        for c in ["v1","v2","v3","v4","v5"]:
+            val = r.get(c)
+            if val and str(val).strip() not in ("", "None", "NaT", "nan"):
+                try:
+                    vd.add(pd.to_datetime(str(val).strip()[:10],
+                                          format="%Y-%m-%d").date())
+                except Exception:
+                    pass
         fac_val[r["Name"]] = vd
 
-    s_off = parse_duty_file(OFFLINE_FILE, "Offline")
-    s_on  = parse_duty_file(ONLINE_FILE,  "Online")
+    # ── Load slots from Supabase ──────────────────────────────────
+    def _rows_to_slots(rows, duty_type):
+        slots = []
+        for r in rows:
+            try:
+                dt   = pd.to_datetime(str(r["duty_date"]).strip()[:10],
+                                      format="%Y-%m-%d").date()
+                sess = normalize_session(r["session"])
+                req  = max(int(r.get("required", 1)), 0)
+                if sess in ("FN", "AN"):
+                    slots.append({"date": dt, "session": sess,
+                                  "required": req, "type": duty_type})
+            except Exception:
+                pass
+        return slots
+
+    s_off = _rows_to_slots(db_get_offline_slots(), "Offline")
+    s_on  = _rows_to_slots(db_get_online_slots(),  "Online")
     ALL_S = s_off + s_on
     NS    = len(ALL_S)
     slot_dates = {s["date"] for s in ALL_S}
