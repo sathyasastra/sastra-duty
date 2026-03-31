@@ -234,8 +234,14 @@ def db_already_submitted(fid: str) -> bool:
 
 def db_submit_willingness(fid: str, faculty_name: str, slots: list):
     _sb().table("willingness").delete().eq("faculty_id", fid).execute()
+    def _to_iso(d):
+        # slots["Date"] is a python date object from selectbox
+        if hasattr(d, "strftime"):
+            return d.strftime("%Y-%m-%d")
+        # fallback: parse string in any format → ISO
+        return pd.to_datetime(str(d), dayfirst=True).strftime("%Y-%m-%d")
     rows = [{"faculty_id": fid, "faculty_name": faculty_name,
-             "duty_date": str(s["Date"]), "session": s["Session"]} for s in slots]
+             "duty_date": _to_iso(s["Date"]), "session": s["Session"]} for s in slots]
     if rows: _sb().table("willingness").insert(rows).execute()
 
 def db_clear_all_willingness():
@@ -517,8 +523,16 @@ def load_willingness():
         return pd.DataFrame(columns=["Faculty","Date","Session","FacultyClean"])
     df = pd.DataFrame(rows)
     df.rename(columns={"faculty_name":"Faculty","duty_date":"Date","session":"Session"}, inplace=True)
-    df["Faculty"]      = df["Faculty"].astype(str).str.strip()
-    df["Date"]         = df["Date"].astype(str).str.strip()
+    df["Faculty"] = df["Faculty"].astype(str).str.strip()
+    # Supabase stores dates as YYYY-MM-DD — convert to dd-mm-yyyy so all
+    # existing code that uses dayfirst=True parses them correctly
+    def _reformat(v):
+        s = str(v).strip()
+        try:
+            return pd.to_datetime(s, format="%Y-%m-%d").strftime("%d-%m-%Y")
+        except Exception:
+            return s
+    df["Date"]         = df["Date"].apply(_reformat)
     df["Session"]      = df["Session"].astype(str).str.strip().str.upper()
     df["FacultyClean"] = df["Faculty"].apply(clean)
     return df[["Faculty","Date","Session","FacultyClean"]].reset_index(drop=True)
