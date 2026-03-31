@@ -1714,7 +1714,10 @@ _defaults = {
     "user_panel_mode":     "Willingness",
     "selected_faculty":    "",
     "selected_slots":      [],
-    "confirm_delete":      False,
+    "confirm_delete":          False,
+    "confirm_delete_will":     False,
+    "confirm_delete_allot":    False,
+    "confirm_full_reset":      False,
     "pending_submissions": pd.DataFrame(columns=["Faculty", "Date", "Session"]),
 }
 for k, val in _defaults.items():
@@ -1880,13 +1883,50 @@ def page_admin(fac_df, offline_df, online_df):
             st.caption("After downloading, go to **🤖 Run Optimizer** → upload → run.")
 
         st.markdown("---")
-        st.markdown("#### ⚠ Delete All Willingness Records")
-        st.checkbox("Confirm deletion of ALL willingness from database", key="confirm_delete")
-        if st.button("Delete All Willingness", type="primary"):
-            if st.session_state.confirm_delete:
+        st.markdown("#### 🗑 Reset Portal Data")
+        st.caption("Use these buttons at the start of a new exam cycle. Each action is permanent.")
+
+        # ── Individual reset buttons side by side ─────────────────
+        rc1, rc2 = st.columns(2)
+        with rc1:
+            st.markdown("**Delete Willingness Only**")
+            st.checkbox("Confirm delete willingness", key="confirm_delete_will")
+            if st.button("🗑 Delete All Willingness", type="primary",
+                         use_container_width=True, key="btn_del_will"):
+                if st.session_state.confirm_delete_will:
+                    db_clear_all_willingness()
+                    st.success("✅ All willingness deleted.")
+                    st.session_state.confirm_delete_will = False
+                    st.rerun()
+                else:
+                    st.error("Tick the confirmation checkbox first.")
+
+        with rc2:
+            st.markdown("**Delete Allotment Only**")
+            st.checkbox("Confirm delete allotment", key="confirm_delete_allot")
+            if st.button("🗑 Delete All Allotment", type="primary",
+                         use_container_width=True, key="btn_del_allot"):
+                if st.session_state.confirm_delete_allot:
+                    _sb().table("final_allocation").delete().neq("id", 0).execute()
+                    st.success("✅ All allotment records deleted.")
+                    st.session_state.confirm_delete_allot = False
+                    st.rerun()
+                else:
+                    st.error("Tick the confirmation checkbox first.")
+
+        st.markdown("---")
+        # ── Combined full reset ───────────────────────────────────
+        st.markdown("**Full Reset — Delete Both Willingness & Allotment**")
+        st.caption("Use this to completely reset before a new examination cycle.")
+        st.checkbox("I confirm full reset of all willingness and allotment data",
+                    key="confirm_full_reset")
+        if st.button("⚠ Full Reset (Willingness + Allotment)", type="primary",
+                     use_container_width=True, key="btn_full_reset"):
+            if st.session_state.confirm_full_reset:
                 db_clear_all_willingness()
-                st.success("All willingness records deleted from Supabase.")
-                st.session_state.confirm_delete = False
+                _sb().table("final_allocation").delete().neq("id", 0).execute()
+                st.success("✅ Full reset complete — all willingness and allotment records deleted.")
+                st.session_state.confirm_full_reset = False
                 st.rerun()
             else:
                 st.error("Tick the confirmation checkbox first.")
