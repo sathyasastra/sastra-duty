@@ -99,7 +99,7 @@ DESIG_MAP = {
 DESIG_RULES = {
     "P":   (1, 1, ["Offline"]),   # Online duty suspended this semester
     "ACP": (2, 2, ["Offline"]),   # Both duties now offline
-    "SAP": (3, 3, ["Offline"]),
+    "SAP": (2, 2, ["Offline"]),
     "AP3": (3, 3, ["Offline"]),
     "AP2": (3, 3, ["Offline"]),
     "TA":  (4, 4, ["Offline"]),   # 4 duties this semester (overridden per-faculty below)
@@ -114,7 +114,7 @@ DESIG_FULL = {
     "TA":  "Teaching Assistant",
     "RA":  "Research Assistant",
 }
-DUTY_STRUCTURE = {"P": 3, "ACP": 5, "SAP": 7, "AP3": 7, "AP2": 7, "TA": 9, "RA": 9}
+DUTY_STRUCTURE = {"P": 3, "ACP": 5, "SAP": 5, "AP3": 6, "AP2": 6, "TA": 9, "RA": 9}
 
 # ── Willingness match scores ──────────────────────────────────── #
 W_EXACT      = 100_000
@@ -1839,9 +1839,13 @@ def page_login(fac_df):
                 else:
                     st.error(f"Incorrect password. Default first-time password is: **{DEFAULT_PASSWORD}**")
 
-        st.caption(
-            f"First-time login: your password is **{DEFAULT_PASSWORD}**. "
-            "You will be prompted to change it on first login.")
+        st.markdown(
+            f'<div class="blink" style="text-align:center;font-size:.96rem;margin-top:10px">'
+            f'🔑 <strong>First-time login:</strong> your password is '
+            f'<strong style="font-size:1.05rem;text-decoration:underline">{DEFAULT_PASSWORD}</strong>. '
+            f'&nbsp;You will be <strong>prompted to change it</strong> on first login.'
+            f'</div>',
+            unsafe_allow_html=True)
 
     st.markdown("---")
     st.caption("Curated by Dr. N. Sathiya Narayanan | School of Mechanical Engineering")
@@ -1855,7 +1859,11 @@ def page_force_change_password():
     render_header(logo=False)
     fid  = st.session_state.faculty_id
     name = st.session_state.faculty_name
-    st.markdown(f"### 🔑 Set Your Password, {name.split()[0]}")
+    st.markdown(f"### 🔑 Set Your Password")
+    st.markdown(
+        f"<div style='text-align:center;font-size:1rem;font-weight:600;color:#0b3a67;"
+        f"margin-bottom:8px'>Welcome, {name}</div>",
+        unsafe_allow_html=True)
     st.info("You must set a new password before continuing. "
             "It must be at least 6 characters and must not be the default password.")
     np1 = st.text_input("New Password", type="password", key="fc_np1")
@@ -2500,11 +2508,9 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
     min_d, _  = fac_duty_range(sel_name, desig2)
     has_sat   = fn_clean in SAT_PREASSIGN_CLEAN
     if has_sat and min_d:
-        req_cnt = min_d - 1   # 1 Saturday pre-assigned
-    elif min_d:
-        req_cnt = min_d
+        req_cnt = min_d - 1   # 1 Saturday pre-assigned; submit for remaining duties
     else:
-        req_cnt = DUTY_STRUCTURE.get(desig2, 0)
+        req_cnt = DUTY_STRUCTURE.get(desig2, min_d or 0)
 
     if req_cnt == 0:
         st.warning(f"Designation '{desig2}' not recognised. Contact admin.")
