@@ -114,7 +114,7 @@ DESIG_FULL = {
     "TA":  "Teaching Assistant",
     "RA":  "Research Assistant",
 }
-DUTY_STRUCTURE = {"P": 3, "ACP": 5, "SAP": 5, "AP3": 6, "AP2": 6, "TA": 9, "RA": 9}
+DUTY_STRUCTURE = {"P": 3, "ACP": 6, "SAP": 6, "AP3": 9, "AP2": 9, "TA": 11, "RA": 11}
 
 # ── Willingness match scores ──────────────────────────────────── #
 W_EXACT      = 100_000
@@ -2507,10 +2507,12 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
     fn_clean  = clean(sel_name)
     min_d, _  = fac_duty_range(sel_name, desig2)
     has_sat   = fn_clean in SAT_PREASSIGN_CLEAN
-    if has_sat and min_d:
-        req_cnt = min_d - 1   # 1 Saturday pre-assigned; submit for remaining duties
+    if fn_clean in FIVE_DUTY_CLEAN:
+        req_cnt = 12    # Last 4 TA: 5 duties, 1 Saturday locked → 12 willingness options
+    elif fn_clean in SAT_PREASSIGN_CLEAN:
+        req_cnt = 11    # First 13 TA + RA: 4 duties, 1 Saturday locked → 11 willingness options
     else:
-        req_cnt = DUTY_STRUCTURE.get(desig2, min_d or 0)
+        req_cnt = DUTY_STRUCTURE.get(desig2, 0)
 
     if req_cnt == 0:
         st.warning(f"Designation '{desig2}' not recognised. Contact admin.")
