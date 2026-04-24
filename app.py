@@ -397,7 +397,7 @@ def _get_preassigned_saturday(fn_clean: str, offline_df, fac_df) -> dict:
     Returns {"date": date, "session": str} or None."""
     if fn_clean not in SAT_PREASSIGN_CLEAN:
         return None
-    sat_df = offline_df[offline_df["Date"].dt.weekday() == 5].sort_values(["Date", "Session"])
+    sat_df = offline_df[offline_df["Date"].dt.weekday == 5].sort_values(["Date", "Session"])
     if sat_df.empty:
         return None
     # Sorted list of all SAT_PREASSIGN faculty (deterministic)
