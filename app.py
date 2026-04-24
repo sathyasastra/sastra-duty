@@ -102,7 +102,7 @@ DESIG_RULES = {
     "SAP": (3, 3, ["Offline"]),
     "AP3": (3, 3, ["Offline"]),
     "AP2": (3, 3, ["Offline"]),
-    "TA":  (3, 3, ["Offline"]),
+    "TA":  (4, 4, ["Offline"]),   # 4 duties this semester (overridden per-faculty below)
     "RA":  (4, 4, ["Offline"]),
 }
 DESIG_FULL = {
@@ -140,7 +140,7 @@ WILL_TAGS = {
     "Willingness-Exact", "Willingness-ACPOnline",
     "Willingness-SessionFlip", "Willingness-±1Day",
     "Willingness-±2Day", "Willingness-ValAdj",
-    "SAP-OnlineFallback"
+    "SAP-OnlineFallback", "Saturday-PreAssigned"
 }
 
 # ─── Page config ─────────────────────────────────────────────── #
@@ -338,6 +338,70 @@ def pw_ensure_all(id_list: list):
 # ═══════════════════════════════════════════════════════════════ #
 def clean(x):
     return str(x).strip().lower()
+
+# ── Saturday TA/RA pre-assignment list ──────────────────────────── #
+_SAT_PREASSIGN_RAW = [
+    "Shri Sangeethkumar Gopaldas", "Shri S. Antony", "Shri S. Balamurli",
+    "Shri R. Rajesh", "Shri. P. Vijay Guru", "Shri E. Ezekiel",
+    "Shri S. Balaganesh", "Shri S. Varadharajan", "Ms S. Kiruba Kari",
+    "Shri V. Adhavan", "Ms. P. Abirami", "Shri V. Ramesh Srenyvasan",
+    "Shri P. Panneerselvam", "Shri S. Sabrish", "Shri S. Manikandan",
+    "Shri P. Sarathkumar", "Shri C. Frizil Kinsly", "Shri Sudhakar S",
+    "Shri N. Arun Kumar",
+]
+SAT_PREASSIGN_CLEAN = {clean(n) for n in _SAT_PREASSIGN_RAW}
+
+# Faculty receiving 5 duties; all others in the list get 4 duties
+_FIVE_DUTY_RAW = [
+    "Shri C. Frizil Kinsly", "Shri P. Sarathkumar", "Shri S. Manikandan",
+    "Shri S. Sabrish", "Shri P. Panneerselvam",
+]
+FIVE_DUTY_CLEAN = {clean(n) for n in _FIVE_DUTY_RAW}
+
+# Per-faculty blackout dates — these faculty will NOT be allotted on these dates
+FACULTY_BLACKOUT_CLEAN: dict = {
+    clean("Shri P. Sarathkumar"):       {datetime.date(2025, 5, 16)},
+    clean("Ms S. Kiruba Kari"):          {datetime.date(2025, 5, 9)},
+    clean("Shri V. Adhavan"):            {datetime.date(2025, 5, 9)},
+    clean("Shri V. Ramesh Srenyvasan"):  {datetime.date(2025, 5, 9)},
+}
+
+
+def fac_duty_range(fn: str, desig: str) -> tuple:
+    """Return (min_duties, max_duties) for a faculty member.
+    Overrides DESIG_RULES for the Saturday TA/RA group."""
+    fc = clean(fn)
+    if fc in FIVE_DUTY_CLEAN:
+        return 5, 5
+    if fc in SAT_PREASSIGN_CLEAN:
+        return 4, 4
+    dr = DESIG_RULES.get(desig, DESIG_RULES["TA"])
+    return dr[0], dr[1]
+
+
+def _get_preassigned_saturday(fn_clean: str, offline_df, fac_df) -> dict:
+    """Deterministically compute the pre-assigned Saturday slot for a faculty member.
+    Returns {"date": date, "session": str} or None."""
+    if fn_clean not in SAT_PREASSIGN_CLEAN:
+        return None
+    sat_df = offline_df[offline_df["Date"].dt.weekday() == 5].sort_values(["Date", "Session"])
+    if sat_df.empty:
+        return None
+    # Sorted list of all SAT_PREASSIGN faculty (deterministic)
+    sat_fac_sorted = sorted(
+        {r["Clean"] for _, r in fac_df.iterrows() if r["Clean"] in SAT_PREASSIGN_CLEAN}
+    )
+    # Expand each slot by its required count
+    expanded = []
+    for _, row in sat_df.iterrows():
+        req = max(int(row.get("Required", 1)), 1)
+        for _ in range(req):
+            expanded.append({"date": row["Date"].date(),
+                             "session": str(row["Session"]).strip().upper()})
+    for i, fc in enumerate(sat_fac_sorted):
+        if fc == fn_clean:
+            return expanded[i] if i < len(expanded) else None
+    return None
 
 def normalize_session(v):
     t = str(v).strip().upper()
@@ -649,6 +713,10 @@ def classify_duty(alloc_by: str, duty_date, duty_sess: str, will_set: set):
         return ("Valuation-Adjacent", "🗓️",
                 f"Allotted on a weekday adjacent to your valuation date "
                 f"({duty_date.strftime('%d-%m-%Y')} {duty_sess})", True)
+    if ab == "Saturday-PreAssigned":
+        return ("Saturday Pre-Assigned", "📅",
+                f"Saturday duty pre-assigned — {duty_date.strftime('%d-%m-%Y')} {duty_sess}",
+                True)
     if ab in ("Auto-Assigned", "Gap-Fill") or ab.startswith("Gap-Fill"):
         return ("Auto-Assigned", "⚙️",
                 "No willingness submitted — system assigned this duty to meet slot requirements",
@@ -721,6 +789,7 @@ def render_deviation_section(allot_rows: pd.DataFrame, will_set: set):
         "Date Adjusted (±2 days)":  ("#ffe4e6", "#881337"),
         "Valuation-Adjacent":       ("#ede9fe", "#5b21b6"),
         "Not in Willingness":       ("#fee2e2", "#991b1b"),
+        "Saturday Pre-Assigned":    ("#fef9c3", "#92400e"),
         "Auto-Assigned":            ("#e5e7eb", "#374151"),
     }
     rows_html = ""
@@ -1077,8 +1146,34 @@ def _load_core(log):
         allowed = DESIG_RULES[d2][2]
         if sl["type"] not in allowed:                                        return False
         if sl["date"] in fac_val.get(fn, set()):                            return False
+        # Per-faculty blackout dates (exam on that day etc.)
+        if clean(fn) in FACULTY_BLACKOUT_CLEAN and sl["date"] in FACULTY_BLACKOUT_CLEAN[clean(fn)]:
+            return False
         if sl["date"].weekday() == 5 and d2 not in SAT_DESIG:              return False
         return True
+
+    # ── Per-faculty duty ranges ───────────────────────────────────────
+    fac_duties = {fn: fac_duty_range(fn, fac_d.get(fn, "TA")) for fn in ALL_FAC}
+
+    # ── Saturday pre-assignments (deterministic, greedy) ─────────────
+    sat_slots_sorted = sorted(
+        [s for s in ALL_S if s["date"].weekday() == 5],
+        key=lambda s: (s["date"], s["session"]))
+    sat_fac_sorted = sorted(
+        [fn for fn in ALL_FAC if clean(fn) in SAT_PREASSIGN_CLEAN],
+        key=lambda fn: clean(fn))
+    sat_preassign: dict = {}
+    _slot_usage_sat: dict = defaultdict(int)
+    for _fn in sat_fac_sorted:
+        for _sl in sat_slots_sorted:
+            _key = (_sl["date"], _sl["session"])
+            if _slot_usage_sat[_key] < _sl["required"] and is_eligible(_fn, _sl):
+                sat_preassign[_fn] = _sl
+                _slot_usage_sat[_key] += 1
+                break
+    log(f"  Saturday pre-assigned : {len(sat_preassign)} / {len(sat_fac_sorted)} faculty")
+    for _fn, _sl in sat_preassign.items():
+        log(f"    {_fn:<38} → {_sl['date'].strftime('%d-%m-%Y')} {_sl['session']}")
 
     return dict(
         fr=fr, ALL_FAC=ALL_FAC, FAC_IDX=FAC_IDX, N_FAC=N_FAC,
@@ -1089,6 +1184,7 @@ def _load_core(log):
         fexp=fexp, tag=tag, is_eligible=is_eligible,
         sap_fallback=sap_fallback, SAT_DESIG=SAT_DESIG,
         acp_2online=acp_2online, acp_2offline=acp_2offline,
+        sat_preassign=sat_preassign, fac_duties=fac_duties,
     )
 
 
@@ -1102,15 +1198,17 @@ def _build_summary(assigned, core):
     alloc.insert(0, "Sl.No", alloc.index + 1)
 
     sumrows = []
+    fac_duties_bs = core.get("fac_duties", {})
     for fn in ALL_FAC:
         d2 = fac_d[fn]; dr = DESIG_RULES[d2]
+        min_d, _ = fac_duties_bs.get(fn, (dr[0], dr[1]))
         rf = alloc[alloc["Name"] == fn]; ab = rf["Allocated_By"]
         tot = len(rf); wt = int(ab.isin(WILL_TAGS).sum())
         sumrows.append({
             "Name": fn, "Designation": d2,
             "Submitted":        "Yes" if fn in submitted else "No",
             "Submitted_Count":  sub_counts.get(fn, 0),
-            "Required_Duties":  dr[0], "Assigned_Duties": tot,
+            "Required_Duties":  min_d, "Assigned_Duties": tot,
             "Willingness_Total":wt,
             "Match_%":          f"{wt/tot*100:.0f}%" if tot else "N/A",
             "Exact_Match":      int((ab=="Willingness-Exact").sum()),
@@ -1123,7 +1221,7 @@ def _build_summary(assigned, core):
             "Auto_Assigned":    int(ab.isin(["Auto-Assigned","OR-Assigned","Gap-Fill"]).sum()),
             "Online":  int((rf["Type"]=="Online").sum()),
             "Offline": int((rf["Type"]=="Offline").sum()),
-            "Gap":     max(dr[0]-tot, 0),
+            "Gap":     max(min_d-tot, 0),
         })
     sumdf = pd.DataFrame(sumrows)
 
@@ -1171,7 +1269,8 @@ def _greedy_solve(core, log):
     acp_offline  = defaultdict(int)
 
     def rem(fn):
-        return DESIG_RULES[fac_d[fn]][1] - alloc_count[fn]
+        _, max_d = fac_duty_range(fn, fac_d.get(fn, "TA"))
+        return max_d - alloc_count[fn]
 
     def eligible(fn, sl):
         if not is_eligible(fn, sl):        return False
@@ -1190,6 +1289,17 @@ def _greedy_solve(core, log):
         return (sc, -alloc_count[fn], -DESIG_PRIORITY.get(fac_d[fn], 0))
 
     assigned = []
+    # ── Saturday pre-assignments: fixed before optimizer ─────────────
+    _sat_pre = core.get("sat_preassign", {})
+    for _fn, _sl in _sat_pre.items():
+        assigned.append({"Name": _fn, "Date": _sl["date"],
+                         "Session": _sl["session"], "Type": _sl["type"],
+                         "Allocated_By": "Saturday-PreAssigned"})
+        alloc_count[_fn] += 1
+        used_dt_sess[_fn].add((_sl["date"], _sl["session"]))
+        if fac_d.get(_fn) == "ACP" and _sl["type"] == "Offline":
+            acp_offline[_fn] += 1
+
     for sl in sorted(ALL_S, key=lambda s: -s["required"]):
         needed = sl["required"]
         cands  = sorted([fn for fn in ALL_FAC if eligible(fn, sl)],
@@ -1224,7 +1334,8 @@ def _greedy_solve(core, log):
                 used_dt_sess[fn].add((sl["date"], sl["session"]))
 
     for fn in ALL_FAC:
-        needed = DESIG_RULES[fac_d[fn]][0] - alloc_count[fn]
+        min_d, _ = fac_duty_range(fn, fac_d.get(fn, "TA"))
+        needed = min_d - alloc_count[fn]
         if needed <= 0: continue
         for sl in sorted(ALL_S, key=lambda s: fexp[fn].get(
                 (s["date"],s["session"],s["type"]),0), reverse=True):
@@ -1276,8 +1387,8 @@ def _cpsat_solve(core, log):
 
         gv = {}
         for fi, fn in enumerate(ALL_FAC):
-            dr = DESIG_RULES[fac_d[fn]]
-            gv[fi] = mdl.NewIntVar(0, dr[0], f"gv_{fi}")
+            min_d, _ = fac_duty_range(fn, fac_d.get(fn, "TA"))
+            gv[fi] = mdl.NewIntVar(0, min_d, f"gv_{fi}")
 
         obj_terms = []
         for fi, fn in enumerate(ALL_FAC):
@@ -1298,9 +1409,9 @@ def _cpsat_solve(core, log):
         for si, sl in enumerate(ALL_S):
             mdl.Add(sum(x[(f, si)] for f in range(N_FAC)) + sv[si] == sl["required"])
         for fi, fn in enumerate(ALL_FAC):
-            dr = DESIG_RULES[fac_d[fn]]
-            mdl.Add(sum(x[(fi, s)] for s in range(NS)) <= dr[1])
-            mdl.Add(sum(x[(fi, s)] for s in range(NS)) + gv[fi] == dr[0])
+            min_d, max_d = fac_duty_range(fn, fac_d.get(fn, "TA"))
+            mdl.Add(sum(x[(fi, s)] for s in range(NS)) <= max_d)
+            mdl.Add(sum(x[(fi, s)] for s in range(NS)) + gv[fi] == min_d)
         for fi in range(N_FAC):
             for sil in dt_sess.values():
                 if len(sil) > 1:
@@ -1312,6 +1423,16 @@ def _cpsat_solve(core, log):
             if fac_d[fn] != "ACP": continue
             fi = FAC_IDX[fn]
             if off_i: mdl.Add(sum(x[(fi, si)] for si in off_i) <= 2)
+
+        # Fix Saturday pre-assignments
+        _sat_pre_cp = core.get("sat_preassign", {})
+        for _fn, _sl in _sat_pre_cp.items():
+            _fi = FAC_IDX.get(_fn)
+            if _fi is None: continue
+            _si = next((i for i, s in enumerate(ALL_S)
+                        if s["date"] == _sl["date"] and s["session"] == _sl["session"]), None)
+            if _si is not None:
+                mdl.Add(x[(_fi, _si)] == 1)
 
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds  = 300
@@ -1394,8 +1515,8 @@ def _milp_solve(core, log):
         c_obj[sv(si)] = float(SLACK_PENALTY)
 
     for fi, fn in enumerate(ALL_FAC):
-        dr = DESIG_RULES[fac_d[fn]]
-        ub[gv(fi)]    = float(dr[0])
+        min_d, _ = fac_duty_range(fn, fac_d.get(fn, "TA"))
+        ub[gv(fi)]    = float(min_d)
         c_obj[gv(fi)] = float(GAP_PENALTY)
 
     rA, cA, dA, blo, bhi = [], [], [], [], []
@@ -1410,10 +1531,10 @@ def _milp_solve(core, log):
                 [1]*N_FAC + [1], sl["required"], sl["required"])
 
     for fi, fn in enumerate(ALL_FAC):
-        dr = DESIG_RULES[fac_d[fn]]
-        add_con([v(fi,s) for s in range(NS)], [1]*NS, 0, dr[1])
+        min_d, max_d = fac_duty_range(fn, fac_d.get(fn, "TA"))
+        add_con([v(fi,s) for s in range(NS)], [1]*NS, 0, max_d)
         add_con([v(fi,s) for s in range(NS)] + [gv(fi)],
-                [1]*NS + [1], dr[0], dr[0])
+                [1]*NS + [1], min_d, min_d)
 
     dt_sess = defaultdict(list)
     for si, sl in enumerate(ALL_S):
@@ -1430,6 +1551,16 @@ def _milp_solve(core, log):
         fi = FAC_IDX[fn]
         if off_i:
             add_con([v(fi,si) for si in off_i], [1]*len(off_i), 0, 2)
+
+    # Fix Saturday pre-assignments (lower bound = 1)
+    _sat_pre_milp = core.get("sat_preassign", {})
+    for _fn, _sl in _sat_pre_milp.items():
+        _fi = FAC_IDX.get(_fn)
+        if _fi is None: continue
+        _si = next((i for i, s in enumerate(ALL_S)
+                    if s["date"] == _sl["date"] and s["session"] == _sl["session"]), None)
+        if _si is not None:
+            lb[v(_fi, _si)] = 1.0
 
     from scipy.sparse import csc_matrix
     A = csc_matrix((dA, (rA, cA)), shape=(nc[0], NV))
@@ -1496,6 +1627,7 @@ def _log_result(assigned, core, method, log):
     log(f"  RESULT  [{method}]")
     log(f"  {'='*54}")
     log(f"  Total assignments   : {tot}")
+    log(f"  ├─ Saturday pre-fix : {int((ab2=='Saturday-PreAssigned').sum())}")
     log(f"  ├─ Exact            : {int((ab2=='Willingness-Exact').sum())}")
     log(f"  ├─ Session flip     : {int((ab2=='Willingness-SessionFlip').sum())}")
     log(f"  ├─ ±1 day           : {int((ab2=='Willingness-±1Day').sum())}")
@@ -2362,9 +2494,17 @@ def page_allotment(fac_df, sel_name, sel_clean, frow, offline_df, online_df):
 def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
     sel_clean = clean(sel_name)
     desig2    = str(frow["Designation"]).strip().upper()
-    req_cnt   = DUTY_STRUCTURE.get(desig2, 0)
     val_d2    = valuation_dates_for(frow)
     val_s2    = set(val_d2)
+    fn_clean  = clean(sel_name)
+    min_d, _  = fac_duty_range(sel_name, desig2)
+    has_sat   = fn_clean in SAT_PREASSIGN_CLEAN
+    if has_sat and min_d:
+        req_cnt = min_d - 1   # 1 Saturday pre-assigned
+    elif min_d:
+        req_cnt = min_d
+    else:
+        req_cnt = DUTY_STRUCTURE.get(desig2, 0)
 
     if req_cnt == 0:
         st.warning(f"Designation '{desig2}' not recognised. Contact admin.")
@@ -2406,10 +2546,37 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
     with left:
         st.subheader("Willingness Submission")
         st.write(f"**Designation:** {DESIG_FULL.get(desig2, desig2)}")
-        duties_min, duties_max = DESIG_RULES.get(desig2, (0, 0, []))[:2]
-        duties_label = str(duties_min) if duties_min == duties_max else f"{duties_min}–{duties_max}"
+        duties_label = str(min_d) if min_d else str(DESIG_RULES.get(desig2,(0,0,[]))[0])
         st.write(f"**Duties to be Allotted:** {duties_label}")
-        st.write(f"**Options to Select:** {req_cnt}")
+        st.write(f"**Options to Select (excl. Saturday):** {req_cnt}" if has_sat
+                 else f"**Options to Select:** {req_cnt}")
+
+        # Saturday pre-assignment banner
+        if has_sat:
+            _pre_sat = _get_preassigned_saturday(fn_clean, offline_df, fac_df)
+            if _pre_sat:
+                _sat_str  = _pre_sat["date"].strftime("%d-%m-%Y (%A)")
+                _sat_sess = _pre_sat["session"]
+                st.markdown(f"""
+<div style="background:#fef9c3;border:2px solid #f59e0b;border-radius:12px;
+            padding:12px 16px;margin:8px 0 12px 0">
+  <div style="font-size:.93rem;font-weight:800;color:#92400e">
+    📅 Saturday Duty — Pre-Assigned & Locked
+  </div>
+  <div style="font-size:.88rem;color:#78350f;margin-top:4px">
+    One Saturday has been automatically allotted to you:<br>
+    <span style="font-weight:800;font-size:.95rem;color:#92400e">
+    {_sat_str} &nbsp;—&nbsp; {_sat_sess}
+    </span>
+  </div>
+  <div style="font-size:.78rem;color:#a16207;margin-top:6px;border-top:1px solid #fcd34d;padding-top:6px">
+    ℹ️ Please submit willingness for your remaining
+    <strong>{req_cnt}</strong> duties below (Saturday above is already locked).
+  </div>
+</div>""", unsafe_allow_html=True)
+            else:
+                st.info(f"📅 One Saturday duty has been pre-allotted to you. "
+                        f"Submit willingness for your remaining {req_cnt} duties below.")
 
         st.markdown("""
 <div style="background:#f0f7ff;border:1.5px solid #93c5fd;border-radius:12px;
