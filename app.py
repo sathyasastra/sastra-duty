@@ -358,12 +358,25 @@ _FIVE_DUTY_RAW = [
 ]
 FIVE_DUTY_CLEAN = {clean(n) for n in _FIVE_DUTY_RAW}
 
-# Per-faculty blackout dates — these faculty will NOT be allotted on these dates
+# Per-faculty exam/blackout dates — these faculty will NOT be allotted on these dates.
+# Highlighted in the willingness UI and calendar with "You have an exam on this date".
 FACULTY_BLACKOUT_CLEAN: dict = {
-    clean("Shri P. Sarathkumar"):       {datetime.date(2025, 5, 16)},
-    clean("Ms S. Kiruba Kari"):          {datetime.date(2025, 5, 9)},
-    clean("Shri V. Adhavan"):            {datetime.date(2025, 5, 9)},
-    clean("Shri V. Ramesh Srenyvasan"):  {datetime.date(2025, 5, 9)},
+    clean("Shri. P. Vijay Guru"):       {datetime.date(2026, 5, 20)},
+    clean("Shri E. Ezekiel"):           {datetime.date(2026, 5, 11)},
+    clean("Shri S. Varadharajan"):      {datetime.date(2026, 5, 22)},
+    clean("Ms S. Kiruba Kari"):         {datetime.date(2026, 5, 9),
+                                         datetime.date(2026, 5, 11),
+                                         datetime.date(2026, 5, 13)},
+    clean("Shri V. Adhavan"):           {datetime.date(2026, 5, 9),
+                                         datetime.date(2026, 5, 11),
+                                         datetime.date(2026, 5, 13)},
+    clean("Shri V. Ramesh Srenyvasan"): {datetime.date(2026, 5, 9),
+                                         datetime.date(2026, 5, 11),
+                                         datetime.date(2026, 5, 13)},
+    clean("Shri S. Sabrish"):           {datetime.date(2026, 5, 22)},
+    clean("Shri P. Sarathkumar"):       {datetime.date(2026, 5, 16),
+                                         datetime.date(2026, 5, 18)},
+    clean("Shri N. Arun Kumar"):        {datetime.date(2026, 5, 26)},
 }
 
 
@@ -863,7 +876,7 @@ def render_deviation_section(allot_rows: pd.DataFrame, will_set: set):
 # ═══════════════════════════════════════════════════════════════ #
 #                    CALENDAR HEATMAP                            #
 # ═══════════════════════════════════════════════════════════════ #
-def render_calendar(duty_df, val_dates, title):
+def render_calendar(duty_df, val_dates, title, exam_dates=None):
     st.markdown(f"#### {title}")
     if duty_df.empty:
         st.info("No slot data available.")
@@ -880,12 +893,18 @@ def render_calendar(duty_df, val_dates, title):
     duty_map = {(row["Date"].date(), str(row["Session"]).upper()): int(row["Required"])
                 for _, row in sg.iterrows()}
     val_set  = set(val_dates)
+    exam_set = set(exam_dates) if exam_dates else set()
     WD_ORDER = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
+    _exam_legend = (
+        "<span style='background:#fee2e2;border:1px solid #fca5a5;border-radius:4px;"
+        "padding:2px 8px;margin-right:6px'>🚫 Exam Date (Locked)</span>"
+    ) if exam_set else ""
     st.markdown(
         "<span style='font-size:.82rem'>"
         "<span style='background:#fce7f3;border:1px solid #f9a8d4;border-radius:4px;"
         "padding:2px 8px;margin-right:6px'>🩷 Valuation Locked</span>"
+        + _exam_legend +
         "<span style='background:#fff;border:1px solid #cbd5e1;border-radius:4px;"
         "padding:2px 8px'>🔢 Number = duties required on that day/session</span>"
         "</span>", unsafe_allow_html=True)
@@ -930,10 +949,12 @@ def render_calendar(duty_df, val_dates, title):
                     date_row += ("<td colspan='2' style='background:#fff;"
                                  "border:1px solid #e2e8f0;height:20px'></td>")
                 else:
-                    is_val = dt in val_set; is_sun = dt.weekday() == 6
-                    bg    = "#fce7f3" if is_val else "#fff"
-                    color = "#be185d" if is_val else ("#94a3b8" if is_sun else "#0f172a")
-                    label = f"{dt.day}" + (" 🔒" if is_val else "")
+                    is_val  = dt in val_set
+                    is_exam = dt in exam_set
+                    is_sun  = dt.weekday() == 6
+                    bg    = "#fce7f3" if is_val else ("#fee2e2" if is_exam else "#fff")
+                    color = "#be185d" if is_val else ("#dc2626" if is_exam else ("#94a3b8" if is_sun else "#0f172a"))
+                    label = f"{dt.day}" + (" 🔒" if is_val else (" 🚫" if is_exam else ""))
                     date_row += (f"<td colspan='2' style='background:{bg};"
                                  f"border:1px solid #e2e8f0;text-align:center;"
                                  f"padding:4px 2px 2px 2px;vertical-align:middle'>"
@@ -947,11 +968,14 @@ def render_calendar(duty_df, val_dates, title):
                     duty_row += ("<td style='background:#fff;border:1px solid #e2e8f0;"
                                  "min-width:44px;height:24px'></td>" * 2)
                 else:
-                    is_val = dt in val_set
+                    is_val  = dt in val_set
+                    is_exam = dt in exam_set
                     for sess in ["FN", "AN"]:
                         req = duty_map.get((dt, sess), 0)
                         if is_val:
                             bg, content = "#fce7f3", ""
+                        elif is_exam:
+                            bg, content = "#fee2e2", ""
                         elif req == 0:
                             bg, content = "#fff", ""
                         else:
@@ -2522,7 +2546,9 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
     sopts = offline_df.copy()
     sopts["Date"]     = pd.to_datetime(sopts["Date"], errors="coerce")
     sopts["DateOnly"] = sopts["Date"].dt.date
-    valid_d = sorted([d for d in sopts["DateOnly"].dropna().unique() if d not in val_s2])
+    fac_blackout_dates = FACULTY_BLACKOUT_CLEAN.get(fn_clean, set())
+    valid_d = sorted([d for d in sopts["DateOnly"].dropna().unique()
+                      if d not in val_s2 and d not in fac_blackout_dates])
 
     if st.session_state.selected_faculty != sel_clean:
         st.session_state.selected_faculty = sel_clean
@@ -2585,6 +2611,26 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
             else:
                 st.info(f"📅 One Saturday duty has been pre-allotted to you. "
                         f"Submit willingness for your remaining {req_cnt} duties below.")
+
+        # Exam date notice (only for faculty with blackout dates)
+        if fac_blackout_dates:
+            _exam_rows = "".join(
+                f"<li style='margin:3px 0'><b>{d.strftime('%d-%m-%Y (%A)')}</b></li>"
+                for d in sorted(fac_blackout_dates)
+            )
+            st.markdown(f"""
+<div style="background:#fee2e2;border:2px solid #ef4444;border-radius:12px;
+            padding:12px 16px;margin:8px 0 12px 0">
+  <div style="font-size:.93rem;font-weight:800;color:#991b1b">
+    🚫 Exam Dates — These dates are locked and cannot be selected
+  </div>
+  <ul style="font-size:.87rem;color:#7f1d1d;margin:6px 0 2px 16px;padding:0">
+    {_exam_rows}
+  </ul>
+  <div style="font-size:.78rem;color:#b91c1c;margin-top:6px;border-top:1px solid #fca5a5;padding-top:5px">
+    ⚠️ You have exams on the above dates. They are excluded from the calendar and the date selector.
+  </div>
+</div>""", unsafe_allow_html=True)
 
         st.markdown("""
 <div style="background:#f0f7ff;border:1.5px solid #93c5fd;border-radius:12px;
@@ -2720,7 +2766,8 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
 
     with right:
         # All designations see the Offline Duty Calendar this semester
-        render_calendar(offline_df, val_s2, "Offline Duty Calendar")
+        render_calendar(offline_df, val_s2, "Offline Duty Calendar",
+                        exam_dates=fac_blackout_dates)
 
 
 # ═══════════════════════════════════════════════════════════════ #
