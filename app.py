@@ -1833,10 +1833,10 @@ def page_admin(fac_df, offline_df, online_df):
             st.checkbox("Confirm delete willingness", key="confirm_delete_will")
             if st.button("🗑 Delete All Willingness", type="primary",
                          use_container_width=True, key="btn_del_will"):
-                if st.session_state.confirm_delete_will:
+                if st.session_state.get("confirm_delete_will"):
                     db_clear_all_willingness()
                     st.success("✅ All willingness deleted.")
-                    st.session_state.confirm_delete_will = False
+                    del st.session_state["confirm_delete_will"]
                     st.rerun()
                 else:
                     st.error("Tick the confirmation checkbox first.")
@@ -1846,10 +1846,10 @@ def page_admin(fac_df, offline_df, online_df):
             st.checkbox("Confirm delete allotment", key="confirm_delete_allot")
             if st.button("🗑 Delete All Allotment", type="primary",
                          use_container_width=True, key="btn_del_allot"):
-                if st.session_state.confirm_delete_allot:
+                if st.session_state.get("confirm_delete_allot"):
                     _sb().table("final_allocation").delete().neq("id", 0).execute()
                     st.success("✅ All allotment records deleted.")
-                    st.session_state.confirm_delete_allot = False
+                    del st.session_state["confirm_delete_allot"]
                     st.rerun()
                 else:
                     st.error("Tick the confirmation checkbox first.")
@@ -1861,11 +1861,11 @@ def page_admin(fac_df, offline_df, online_df):
                     key="confirm_full_reset")
         if st.button("⚠ Full Reset (Willingness + Allotment)", type="primary",
                      use_container_width=True, key="btn_full_reset"):
-            if st.session_state.confirm_full_reset:
+            if st.session_state.get("confirm_full_reset"):
                 db_clear_all_willingness()
                 _sb().table("final_allocation").delete().neq("id", 0).execute()
                 st.success("✅ Full reset complete — all willingness and allotment records deleted.")
-                st.session_state.confirm_full_reset = False
+                del st.session_state["confirm_full_reset"]
                 st.rerun()
             else:
                 st.error("Tick the confirmation checkbox first.")
