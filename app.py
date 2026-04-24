@@ -5,9 +5,8 @@ Files required in the same folder as app.py:
   1. Faculty_Master.xlsx  — columns: S.No. | ID No. | NAME OF STAFF | Designation
                             (+ optional valuation date cols V1..V5)
   2. Offline_Duty.xlsx    — offline exam slots  (col A: Date | col B: FN/AN | col C: count)
-  3. Online_Duty.xlsx     — online exam slots   (col A: Date | col B: FN/AN | col C: count)
-  4. sastra_logo.png      — university logo (optional)
-  5. faculty_passwords.json — auto-created on first run; keyed by Faculty ID No.
+  3. sastra_logo.png      — university logo (optional)
+  4. faculty_passwords.json — auto-created on first run; keyed by Faculty ID No.
 
 Login:
   Faculty portal : enter your Faculty ID (e.g. C870, RS602) + password
@@ -16,6 +15,7 @@ Login:
 
 v5 — ID-based login | bcrypt passwords | resubmission | accommodation stats
      Core optimizer: scipy HiGHS MILP | Smart Greedy | OR-Tools CP-SAT
+     NOTE: Online duty suspended this semester — all duties are Offline only.
 """
 
 import os
@@ -95,9 +95,10 @@ DESIG_MAP = {
     "research assistant": "RA",
     "ra":                 "RA",
 }
+# Option B: Online duty suspended — all designations use Offline only
 DESIG_RULES = {
-    "P":   (1, 1, ["Online"]),
-    "ACP": (2, 2, ["Online", "Offline"]),
+    "P":   (1, 1, ["Offline"]),   # Online duty suspended this semester
+    "ACP": (2, 2, ["Offline"]),   # Both duties now offline
     "SAP": (3, 3, ["Offline"]),
     "AP3": (3, 3, ["Offline"]),
     "AP2": (3, 3, ["Offline"]),
@@ -217,8 +218,7 @@ def db_get_offline_slots():
     return r.data or []
 
 def db_get_online_slots():
-    r = _sb().table("online_duty").select("*").execute()
-    return r.data or []
+    return []          # No online duty this semester
 
 def db_get_all_willingness_rows():
     r = _sb().table("willingness").select("*").order("faculty_name").execute()
@@ -500,7 +500,7 @@ def parse_duty_file(filepath, duty_type):
 
 @st.cache_data(ttl=300)
 def load_slots(off_path, on_path):
-    """Load duty slots from Supabase instead of Excel files."""
+    """Load offline duty slots from Supabase. No online duty this semester."""
     def rows_to_df(rows):
         if not rows:
             df = pd.DataFrame(columns=["Date","Session","Required"])
@@ -511,7 +511,9 @@ def load_slots(off_path, on_path):
         df["Session"]  = df["Session"].apply(normalize_session)
         df["Required"] = pd.to_numeric(df["Required"], errors="coerce").fillna(1).astype(int)
         return df[["Date","Session","Required"]]
-    return rows_to_df(db_get_offline_slots()), rows_to_df(db_get_online_slots())
+    _empty = pd.DataFrame(columns=["Date","Session","Required"])
+    _empty["Date"] = pd.to_datetime(_empty["Date"])
+    return rows_to_df(db_get_offline_slots()), _empty
 
 
 # ═══════════════════════════════════════════════════════════════ #
@@ -943,7 +945,7 @@ def _load_core(log):
                     pass
         fac_val[r["Name"]] = vd
 
-    # ── Load slots from Supabase ──────────────────────────────────
+    # ── Load slots from Supabase (offline only) ───────────────────
     def _rows_to_slots(rows, duty_type):
         slots = []
         for r in rows:
@@ -960,8 +962,8 @@ def _load_core(log):
         return slots
 
     s_off = _rows_to_slots(db_get_offline_slots(), "Offline")
-    s_on  = _rows_to_slots(db_get_online_slots(),  "Online")
-    ALL_S = s_off + s_on
+    s_on  = []   # No online duty this semester
+    ALL_S = s_off
     NS    = len(ALL_S)
     slot_dates = {s["date"] for s in ALL_S}
 
@@ -978,7 +980,7 @@ def _load_core(log):
             sub_counts[n.strip()] = len(grp)
 
     log(f"  Faculty        : {N_FAC}")
-    log(f"  Slots          : {NS}  ({len(s_off)} offline + {len(s_on)} online)")
+    log(f"  Slots          : {NS}  (offline only — online duty suspended)")
     log(f"  Seats needed   : {sum(s['required'] for s in ALL_S)}")
     log(f"  Willingness    : {len(submitted)} submitted | {len(non_sub)} not submitted")
 
@@ -986,8 +988,8 @@ def _load_core(log):
     sap_faculty  = [n for n in ALL_FAC if fac_d.get(n) == "SAP"]
     sap_fallback = sap_faculty[:2]
     acp_faculty  = [n for n in ALL_FAC if fac_d.get(n) == "ACP"]
-    acp_2online  = set(acp_faculty[:2])
-    acp_2offline = set(acp_faculty[-2:])
+    acp_2online  = set()   # No online duty
+    acp_2offline = set(acp_faculty)
 
     log(f"\n  ── Capacity Check ───────────────────────────────────")
     any_cap_warn = False
@@ -996,13 +998,9 @@ def _load_core(log):
         for fn in ALL_FAC:
             d2 = fac_d.get(fn, "TA")
             allowed = DESIG_RULES[d2][2]
-            eff_allowed = list(allowed)
-            if fn in sap_fallback and "Online" not in eff_allowed:
-                eff_allowed = eff_allowed + ["Online"]
-            if sl["type"] not in eff_allowed: continue
-            if sl["type"] == "Offline" and sl["date"] in fac_val.get(fn, set()): continue
-            if sl["type"] == "Offline" and sl["date"].weekday() == 5 and d2 not in SAT_DESIG: continue
-            if sl["type"] == "Online"  and sl["date"].weekday() == 5 and d2 not in {"P", "ACP"}: continue
+            if sl["type"] not in allowed: continue
+            if sl["date"] in fac_val.get(fn, set()): continue
+            if sl["date"].weekday() == 5 and d2 not in SAT_DESIG: continue
             avail += 1
         if avail < sl["required"]:
             ds = sl["date"].strftime("%d-%m-%Y")
@@ -1030,14 +1028,6 @@ def _load_core(log):
         allowed = DESIG_RULES[fac_d.get(n, "TA")][2]
         for tp in allowed:
             sset(fexp[n], (dt2, sess, tp), W_EXACT)
-        if fac_d.get(n) == "ACP":
-            for s2 in ["FN","AN"]:
-                sset(fexp[n], (dt2, s2, "Online"), W_ACP_ONLINE)
-            for direction in [+1,-1]:
-                adj = next_biz(dt2, direction)
-                if adj in slot_dates:
-                    for s2 in ["FN","AN"]:
-                        sset(fexp[n], (adj, s2, "Online"), W_ACP_ONLINE - 5_000)
         for tp in allowed:
             sset(fexp[n], (dt2, opp, tp), W_FLIP)
         for direction in [+1,-1]:
@@ -1071,21 +1061,6 @@ def _load_core(log):
             if s["type"] in allowed:
                 sset(fexp[n], (s["date"], s["session"], s["type"]), W_NON_SUB)
 
-    for n in ALL_FAC:
-        if fac_d.get(n) == "ACP":
-            for s in ALL_S:
-                if s["type"] == "Online":
-                    k = (s["date"], s["session"], "Online")
-                    if fexp[n].get(k, 0) == 0:
-                        sset(fexp[n], k, 1_000)
-
-    for n in sap_fallback:
-        for s in ALL_S:
-            if s["type"] == "Online":
-                k = (s["date"], s["session"], "Online")
-                if fexp[n].get(k, 0) == 0:
-                    sset(fexp[n], k, 500)
-
     def tag(fn, k, sc):
         if fn in non_sub:          return "Auto-Assigned"
         if sc >= W_EXACT:          return "Willingness-Exact"
@@ -1100,11 +1075,9 @@ def _load_core(log):
     def is_eligible(fn, sl):
         d2 = fac_d.get(fn, "TA")
         allowed = DESIG_RULES[d2][2]
-        eff = list(allowed) + (["Online"] if fn in sap_fallback else [])
-        if sl["type"] not in eff:                                    return False
-        if sl["type"] == "Offline" and sl["date"] in fac_val.get(fn, set()): return False
-        if sl["type"] == "Offline" and sl["date"].weekday() == 5 and d2 not in SAT_DESIG: return False
-        if sl["type"] == "Online"  and sl["date"].weekday() == 5 and d2 not in {"P", "ACP"}: return False
+        if sl["type"] not in allowed:                                        return False
+        if sl["date"] in fac_val.get(fn, set()):                            return False
+        if sl["date"].weekday() == 5 and d2 not in SAT_DESIG:              return False
         return True
 
     return dict(
@@ -1206,14 +1179,9 @@ def _greedy_solve(core, log):
         if (sl["date"], sl["session"]) in used_dt_sess[fn]: return False
         d2 = fac_d[fn]
         if d2 == "ACP":
-            if sl["type"] == "Online":
-                limit_on = 2 if fn in acp_2online else 1
-                if acp_online[fn] >= limit_on: return False
             if sl["type"] == "Offline":
-                limit_off = 2 if fn in acp_2offline else 1
+                limit_off = 2
                 if acp_offline[fn] >= limit_off: return False
-        if fn in sap_fallback and sl["type"] == "Online" and alloc_count[fn] >= DESIG_RULES[d2][0]:
-            return False
         return True
 
     def score(fn, sl):
@@ -1222,7 +1190,7 @@ def _greedy_solve(core, log):
         return (sc, -alloc_count[fn], -DESIG_PRIORITY.get(fac_d[fn], 0))
 
     assigned = []
-    for sl in sorted(ALL_S, key=lambda s: (s["type"]!="Online", -s["required"])):
+    for sl in sorted(ALL_S, key=lambda s: -s["required"]):
         needed = sl["required"]
         cands  = sorted([fn for fn in ALL_FAC if eligible(fn, sl)],
                         key=lambda fn: score(fn, sl), reverse=True)
@@ -1235,7 +1203,6 @@ def _greedy_solve(core, log):
             alloc_count[fn] += 1
             used_dt_sess[fn].add((sl["date"], sl["session"]))
             if fac_d[fn] == "ACP":
-                if sl["type"] == "Online":  acp_online[fn]  += 1
                 if sl["type"] == "Offline": acp_offline[fn] += 1
 
         filled = sum(1 for a in assigned
@@ -1339,17 +1306,12 @@ def _cpsat_solve(core, log):
                 if len(sil) > 1:
                     mdl.Add(sum(x[(fi, si)] for si in sil) <= 1)
 
-        acp_2online  = core["acp_2online"]
         acp_2offline = core["acp_2offline"]
-        on_i  = [i for i, s in enumerate(ALL_S) if s["type"] == "Online"]
         off_i = [i for i, s in enumerate(ALL_S) if s["type"] == "Offline"]
         for fn in ALL_FAC:
             if fac_d[fn] != "ACP": continue
             fi = FAC_IDX[fn]
-            max_on  = 2 if fn in acp_2online  else 1
-            max_off = 2 if fn in acp_2offline else 1
-            if on_i:  mdl.Add(sum(x[(fi, si)] for si in on_i)  <= max_on)
-            if off_i: mdl.Add(sum(x[(fi, si)] for si in off_i) <= max_off)
+            if off_i: mdl.Add(sum(x[(fi, si)] for si in off_i) <= 2)
 
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds  = 300
@@ -1461,19 +1423,13 @@ def _milp_solve(core, log):
             if len(sil) > 1:
                 add_con([v(fi,si) for si in sil], [1]*len(sil), 0, 1)
 
-    acp_2online  = core["acp_2online"]
     acp_2offline = core["acp_2offline"]
-    on_i  = [i for i, s in enumerate(ALL_S) if s["type"] == "Online"]
     off_i = [i for i, s in enumerate(ALL_S) if s["type"] == "Offline"]
     for fn in ALL_FAC:
         if fac_d[fn] != "ACP": continue
         fi = FAC_IDX[fn]
-        max_on  = 2 if fn in acp_2online  else 1
-        max_off = 2 if fn in acp_2offline else 1
-        if on_i:
-            add_con([v(fi,si) for si in on_i],  [1]*len(on_i),  0, max_on)
         if off_i:
-            add_con([v(fi,si) for si in off_i], [1]*len(off_i), 0, max_off)
+            add_con([v(fi,si) for si in off_i], [1]*len(off_i), 0, 2)
 
     from scipy.sparse import csc_matrix
     A = csc_matrix((dA, (rA, cA)), shape=(nc[0], NV))
@@ -1541,12 +1497,10 @@ def _log_result(assigned, core, method, log):
     log(f"  {'='*54}")
     log(f"  Total assignments   : {tot}")
     log(f"  ├─ Exact            : {int((ab2=='Willingness-Exact').sum())}")
-    log(f"  ├─ ACP Online       : {int((ab2=='Willingness-ACPOnline').sum())}")
     log(f"  ├─ Session flip     : {int((ab2=='Willingness-SessionFlip').sum())}")
     log(f"  ├─ ±1 day           : {int((ab2=='Willingness-±1Day').sum())}")
     log(f"  ├─ ±2 days          : {int((ab2=='Willingness-±2Day').sum())}")
     log(f"  ├─ Val-adjacent     : {int((ab2=='Willingness-ValAdj').sum())}")
-    log(f"  ├─ SAP online       : {int((ab2=='SAP-OnlineFallback').sum())}")
     log(f"  └─ Auto/OR-assigned : {int(ab2.isin(['Auto-Assigned','OR-Assigned','Gap-Fill']).sum())}")
     log(f"\n  ★ Willingness match : {overall_pct:.1f}%  ({will_matched}/{will_total})")
     log(f"  Slots filled        : {len(slotdf)-len(unmet)}/{len(slotdf)}"
@@ -1556,24 +1510,11 @@ def _log_result(assigned, core, method, log):
 
     acp = sumdf[sumdf["Designation"]=="ACP"]
     p   = sumdf[sumdf["Designation"]=="P"]
-    acp_2online  = core["acp_2online"]
-    acp_2offline = core["acp_2offline"]
-    p_ok = len(p[p["Online"]==1])
-    log(f"  P   (1 online)      : {p_ok}/{len(p)}")
-    log(f"  ACP summary:")
+    log(f"  P   (1 offline)     : {len(p[p['Offline']>=1])}/{len(p)}")
+    log(f"  ACP summary (all offline this semester):")
     for _, r in acp.iterrows():
-        on_c  = int(r["Online"]); off_c = int(r["Offline"])
-        pattern = f"{on_c} online + {off_c} offline"
-        if r["Name"] in acp_2online:   note = "  [first-2: up to 2 online]"
-        elif r["Name"] in acp_2offline: note = "  [last-2: up to 2 offline]"
-        else:                           note = "  [standard: 1+1]"
-        flag = "" if on_c >= 1 else "  !! NO ONLINE !!"
-        log(f"    {r['Name']:<32} {pattern}{note}{flag}")
-    if sap_fallback:
-        sap_on = sumdf[sumdf["Name"].isin(sap_fallback)][["Name","Online","Offline"]]
-        for _, r in sap_on.iterrows():
-            if r["Online"] > 0:
-                log(f"  SAP fallback used   : {r['Name']} -> {int(r['Online'])} online")
+        off_c = int(r["Offline"])
+        log(f"    {r['Name']:<32} {off_c} offline")
 
     return alloc, sumdf, slotdf, desigdf, overall_pct, len(unmet), len(gaps)
 
@@ -1589,6 +1530,7 @@ def run_optimizer(log_box):
     log(f"  Method A: scipy HiGHS MILP")
     log(f"  Method B: Smart Greedy")
     log(f"  Method C: OR-Tools CP-SAT  ({'✅ Available' if ORTOOLS_OK else '❌ Not available'})")
+    log(f"  NOTE: Online duty suspended — all slots are Offline this semester")
     log("=" * 62)
 
     log("\n  Loading data...")
@@ -1705,9 +1647,9 @@ def run_optimizer(log_box):
 # ═══════════════════════════════════════════════════════════════ #
 _defaults = {
     "logged_in":           False,
-    "faculty_id":          "",       # e.g. "C870" — the ID No. from Excel
-    "faculty_name":        "",       # display name
-    "faculty_clean":       "",       # clean(name) — still used for willingness matching
+    "faculty_id":          "",
+    "faculty_name":        "",
+    "faculty_clean":       "",
     "is_admin":            False,
     "must_change_pw":      False,
     "panel_mode":          "User View",
@@ -1880,13 +1822,11 @@ def page_admin(fac_df, offline_df, online_df):
                     file_name="Willingness.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True)
-            st.caption("After downloading, go to **🤖 Run Optimizer** → upload → run.")
 
         st.markdown("---")
         st.markdown("#### 🗑 Reset Portal Data")
         st.caption("Use these buttons at the start of a new exam cycle. Each action is permanent.")
 
-        # ── Individual reset buttons side by side ─────────────────
         rc1, rc2 = st.columns(2)
         with rc1:
             st.markdown("**Delete Willingness Only**")
@@ -1915,7 +1855,6 @@ def page_admin(fac_df, offline_df, online_df):
                     st.error("Tick the confirmation checkbox first.")
 
         st.markdown("---")
-        # ── Combined full reset ───────────────────────────────────
         st.markdown("**Full Reset — Delete Both Willingness & Allotment**")
         st.caption("Use this to completely reset before a new examination cycle.")
         st.checkbox("I confirm full reset of all willingness and allotment data",
@@ -1934,18 +1873,17 @@ def page_admin(fac_df, offline_df, online_df):
     # ── Tab 2: Run Optimizer ─────────────────────────────────────── #
     with t2:
         st.markdown("### 🤖 Run Allocation Optimizer")
+        st.info("ℹ️ Online duty is suspended this semester. All duties are offline only.")
         st.markdown("#### 📁 Data Source Status (Supabase)")
         _w_all  = get_all_willingness()
         _wrows  = len(_w_all)
         _wfac   = _w_all["Faculty"].nunique() if not _w_all.empty and "Faculty" in _w_all.columns else 0
         _off_ok = len(offline_df) > 0
-        _on_ok  = len(online_df) > 0
         st.markdown(f"""
 | Source | Purpose | Status |
 |---|---|---|
 | Supabase `faculty` | Faculty list + designations | ✅ {len(fac_df)} records |
 | Supabase `offline_duty` | Offline exam slots | {"✅ " + str(len(offline_df)) + " slots" if _off_ok else "❌ No data"} |
-| Supabase `online_duty`  | Online exam slots  | {"✅ " + str(len(online_df))  + " slots" if _on_ok  else "❌ No data"} |
 | Supabase `willingness`  | Faculty willingness | ✅ {_wrows} rows, {_wfac} faculty |
 """)
         c1, c2, c3 = st.columns(3)
@@ -1965,7 +1903,7 @@ def page_admin(fac_df, offline_df, online_df):
 
             st.markdown("#### 🔍 Pre-Run Diagnostic")
             diag_wdf        = get_all_willingness()
-            slot_dates_diag = set(offline_df["Date"].dt.date.dropna()) | set(online_df["Date"].dt.date.dropna())
+            slot_dates_diag = set(offline_df["Date"].dt.date.dropna())
 
             if not diag_wdf.empty and slot_dates_diag:
                 wdf_diag = diag_wdf.copy()
@@ -2056,7 +1994,6 @@ def page_admin(fac_df, offline_df, online_df):
                 sel_sumdf  = st.session_state.get(f"sumdf_{chosen_key.lower()}")
                 sel_slotdf = st.session_state.get(f"slotdf_{chosen_key.lower()}")
                 if sel_alloc is not None:
-                    # Save to Supabase
                     _recs = []
                     for _, _ar in sel_alloc.iterrows():
                         _nm = str(_ar.get("Name","")).strip()
@@ -2072,7 +2009,6 @@ def page_admin(fac_df, offline_df, online_df):
                             "allocated_by": str(_ar.get("Allocated_By","")).strip(),
                         })
                     db_save_allocation(_recs)
-                    # Also keep local Excel for download
                     sel_alloc.to_excel(FINAL_ALLOC_FILE, index=False)
                     with pd.ExcelWriter(ALLOC_REPORT_FILE, engine="openpyxl") as writer:
                         sel_alloc.to_excel(writer,  sheet_name="Full_Allocation",   index=False)
@@ -2100,7 +2036,6 @@ def page_admin(fac_df, offline_df, online_df):
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             st.markdown("---")
 
-        # Load from Supabase if no local file, or always prefer Supabase
         _db_alloc_rows = db_get_all_allocation()
         if _db_alloc_rows:
             av = pd.DataFrame(_db_alloc_rows)
@@ -2116,7 +2051,6 @@ def page_admin(fac_df, offline_df, online_df):
         if av.empty:
             st.info("No results yet. Run the optimizer first.")
         else:
-            av  = av
             rep = {}
             if os.path.exists(ALLOC_REPORT_FILE):
                 xl2 = pd.ExcelFile(ALLOC_REPORT_FILE)
@@ -2173,20 +2107,22 @@ def page_admin(fac_df, offline_df, online_df):
             st.dataframe(av, use_container_width=True, hide_index=True)
             col1, col2 = st.columns(2)
             with col1:
-                with open(FINAL_ALLOC_FILE, "rb") as fh:
-                    st.download_button("⬇ Final_Allocation.xlsx", data=fh.read(),
-                        file_name="Final_Allocation.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                if os.path.exists(FINAL_ALLOC_FILE):
+                    with open(FINAL_ALLOC_FILE, "rb") as fh:
+                        st.download_button("⬇ Final_Allocation.xlsx", data=fh.read(),
+                            file_name="Final_Allocation.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             with col2:
-                with open(ALLOC_REPORT_FILE, "rb") as fh:
-                    st.download_button("⬇ Allocation_Report.xlsx", data=fh.read(),
-                        file_name="Allocation_Report.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                if os.path.exists(ALLOC_REPORT_FILE):
+                    with open(ALLOC_REPORT_FILE, "rb") as fh:
+                        st.download_button("⬇ Allocation_Report.xlsx", data=fh.read(),
+                            file_name="Allocation_Report.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
     # ── Tab 4: Faculty Accounts ─────────────────────────────────── #
     with t4:
         st.markdown("### 👥 Faculty Account Management")
-        st.caption("View all faculty accounts (keyed by ID No.), reset passwords, and manage admin rights.")
+        st.caption("View all faculty accounts, reset passwords, and manage admin rights.")
 
         all_fac_rows = db_get_all_faculty()
         id_name_map  = {r["faculty_id"]: r["name"] for r in all_fac_rows}
@@ -2296,7 +2232,7 @@ def page_admin(fac_df, offline_df, online_df):
             db_set_setting("semester_override", _new_sem)
             st.session_state["semester_override"] = _new_sem
             st.success(f"Semester set to: **{_new_sem}**"); st.rerun()
-        _pslot_dates = set(offline_df["Date"].dt.date.dropna()) | set(online_df["Date"].dt.date.dropna())
+        _pslot_dates = set(offline_df["Date"].dt.date.dropna())
         st.caption(f"Currently showing: **{detect_semester(_pslot_dates)}**")
 
 
@@ -2306,7 +2242,7 @@ def page_admin(fac_df, offline_df, online_df):
 def page_allotment(fac_df, sel_name, sel_clean, frow, offline_df, online_df):
     st.markdown("### My Allotment Details")
 
-    _aslot_dates = set(offline_df["Date"].dt.date.dropna()) | set(online_df["Date"].dt.date.dropna())
+    _aslot_dates = set(offline_df["Date"].dt.date.dropna())
     _asem = detect_semester(_aslot_dates)
     _as, _ae     = get_exam_period(_aslot_dates)
     if _as and _ae:
@@ -2364,7 +2300,6 @@ def page_allotment(fac_df, sel_name, sel_clean, frow, offline_df, online_df):
         if pd.notna(nd2):
             allot_pairs.add((nd2.date(), _sess))
 
-    # Willingness accommodation percentage
     if will_pairs:
         matched = len(will_pairs & allot_pairs)
         acc_pct = f"{matched/len(will_pairs)*100:.1f}%  ({matched}/{len(will_pairs)})"
@@ -2391,7 +2326,6 @@ def page_allotment(fac_df, sel_name, sel_clean, frow, offline_df, online_df):
         st.dataframe(pd.DataFrame({"Date": qd or ["Not available"]}),
                      use_container_width=True, hide_index=True)
 
-    # Accommodation stat banner
     st.markdown(
         f"<div style='margin-top:10px;padding:12px 16px;background:#f0fdf4;"
         f"border:1.5px solid #86efac;border-radius:10px;font-size:.9rem;color:#166534'>"
@@ -2436,7 +2370,8 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
         st.warning(f"Designation '{desig2}' not recognised. Contact admin.")
         return
 
-    sopts = online_df.copy() if desig2 == "P" else offline_df.copy()
+    # All designations use offline slots this semester
+    sopts = offline_df.copy()
     sopts["Date"]     = pd.to_datetime(sopts["Date"], errors="coerce")
     sopts["DateOnly"] = sopts["Date"].dt.date
     valid_d = sorted([d for d in sopts["DateOnly"].dropna().unique() if d not in val_s2])
@@ -2450,8 +2385,7 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
         st.session_state["picked_date"] = valid_d[0] if valid_d else None
 
     # Show exam period banner
-    _all_slots_user  = parse_duty_file(OFFLINE_FILE, "Offline") + parse_duty_file(ONLINE_FILE, "Online")
-    _slot_dates_user = {s["date"] for s in _all_slots_user}
+    _slot_dates_user = set(offline_df["Date"].dt.date.dropna())
     _sem_label       = detect_semester(_slot_dates_user)
     _exam_start, _exam_end = get_exam_period(_slot_dates_user)
 
@@ -2516,16 +2450,11 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
   </div>
 </div>""", unsafe_allow_html=True)
 
-        if desig2 == "ACP":
-            st.info("ACP faculty will receive one Online and one Offline duty. "
-                    "Please select all available dates from the Offline calendar. "
-                    "Online duty will be assigned automatically from your submitted dates.")
-
         if not valid_d:
             st.warning("No dates available for selection.")
         else:
             picked = st.selectbox(
-                "Choose Online Date" if desig2 == "P" else "Choose Offline Date",
+                "Choose Offline Date",
                 valid_d, key="picked_date",
                 format_func=lambda d: d.strftime("%d-%m-%Y (%A)"))
             avail = set(sopts[sopts["DateOnly"] == picked]["Session"]
@@ -2615,10 +2544,8 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
                 "using MILP optimization. Check this portal for allotment updates.")
 
     with right:
-        if desig2 == "P":
-            render_calendar(online_df, val_s2, "Online Duty Calendar")
-        else:
-            render_calendar(offline_df, val_s2, "Offline Duty Calendar")
+        # All designations see the Offline Duty Calendar this semester
+        render_calendar(offline_df, val_s2, "Offline Duty Calendar")
 
 
 # ═══════════════════════════════════════════════════════════════ #
@@ -2649,7 +2576,7 @@ def main():
     # ── 2. Login gate ─────────────────────────────────────────────
     if not st.session_state.logged_in:
         page_login(fac_df)
-        return  # st.stop() inside page_login
+        return
 
     # ── 3. Force password change ──────────────────────────────────
     if st.session_state.must_change_pw:
@@ -2699,7 +2626,6 @@ def main():
     sub = st.radio("View", ["Willingness", "My Allotment", "Change Password"],
                    horizontal=True, key="user_panel_mode")
 
-    # Identify current faculty's row in the master list
     sel_name  = st.session_state.faculty_name
     sel_clean = st.session_state.faculty_clean
     fmatch    = fac_df[fac_df["Clean"] == sel_clean]
