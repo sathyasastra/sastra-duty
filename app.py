@@ -185,7 +185,20 @@ DESIG_FULL = {
 # ── Per-faculty designation overrides ───────────────────────────────────────
 # Use when the Supabase designation field is NULL/blank/incorrect for a faculty.
 # Key = exact faculty name (as stored in Supabase), Value = designation code
-# ── Per-faculty designation overrides (safety net) ──────────────────────────
+# ── Per-faculty valuation date overrides (safety net) ────────────────────────
+# Used when Supabase v1-v5 columns are NULL or missing for a faculty.
+# Key = exact name as stored in Supabase | Value = set of date strings "YYYY-MM-DD"
+FACULTY_VALUATION_OVERRIDE_RAW: dict = {
+    "T.Mohanraj":       {"2026-06-16"},
+    "T.Panneerselvam":  {"2026-06-16"},
+    "S. Hariharan":     {"2026-06-16"},
+    "B.Jayaraman":      {"2026-06-16"},
+    "G. Rajamohan":     {"2026-06-16"},
+    "K. Palaksha Reddy":{"2026-06-16"},
+    "D.Venkatesan":     {"2026-06-16"},
+    "M. Tagore":        {"2026-06-16"},
+    "S. Paul Joshua":   {"2026-06-16"},
+}
 # Supabase already has correct values. This overrides at app level as backup.
 # Key = exact name as stored in Supabase | Value = designation code
 FACULTY_DESIG_OVERRIDE_RAW: dict = {
@@ -455,6 +468,12 @@ def _norm_name(name: str) -> str:
 # Build clean-keyed lookup after clean() is available
 FACULTY_DESIG_OVERRIDE = {_norm_name(k): v for k, v in FACULTY_DESIG_OVERRIDE_RAW.items()}
 
+# Build valuation override with _norm_name keys
+FACULTY_VALUATION_OVERRIDE = {
+    _norm_name(k): {pd.Timestamp(d).date() for d in v}
+    for k, v in FACULTY_VALUATION_OVERRIDE_RAW.items()
+}
+
 # ── TA/RA duty-count group (4 or 5 duties, may select Saturday dates) ── #
 _SAT_PREASSIGN_RAW = [
     "Shri Sangeethkumar Gopaldas", "Shri S. Antony", "Shri S. Balamurli",
@@ -562,7 +581,7 @@ def demand_category(req: int) -> str:
     if req <= 7: return "Medium (3-7)"
     return "High (>7)"
 
-def valuation_dates_for(row):
+def valuation_dates_for(row, faculty_name: str = ""):
     dates = set()
     for c in ["V1", "V2", "V3", "V4", "V5"]:
         if c not in row.index:
@@ -583,6 +602,10 @@ def valuation_dates_for(row):
                 dates.add(ts.date())
         except Exception:
             pass
+    # Merge override dates (ensures 16-Jun-2026 always shows for specified faculty)
+    fn = _norm_name(faculty_name)
+    if fn in FACULTY_VALUATION_OVERRIDE:
+        dates |= FACULTY_VALUATION_OVERRIDE[fn]
     return sorted(dates)
 
 def qp_dates_for(row):
@@ -2569,7 +2592,7 @@ def page_allotment(fac_df, sel_name, sel_clean, frow, offline_df, online_df):
             "</div>", unsafe_allow_html=True)
         return
 
-    vd = [f"{fmt_day(d.strftime('%d-%m-%Y'))} - Full Day" for d in valuation_dates_for(frow)]
+    vd = [f"{fmt_day(d.strftime('%d-%m-%Y'))} - Full Day" for d in valuation_dates_for(frow, sel_name)]
     qd = [fmt_day(d) for d in qp_dates_for(frow)]
 
     wd2   = load_willingness()
@@ -2664,7 +2687,7 @@ def page_allotment(fac_df, sel_name, sel_clean, frow, offline_df, online_df):
 def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
     sel_clean = clean(sel_name)
     desig2    = str(frow["Designation"]).strip().upper()
-    val_d2    = valuation_dates_for(frow)
+    val_d2    = valuation_dates_for(frow, sel_name)
     val_s2    = set(val_d2)
     fn_clean  = _norm_name(sel_name)
     min_d, _  = fac_duty_range(sel_name, desig2)
