@@ -945,7 +945,7 @@ def render_deviation_section(allot_rows: pd.DataFrame, will_set: set):
 # ═══════════════════════════════════════════════════════════════ #
 #                    CALENDAR HEATMAP                            #
 # ═══════════════════════════════════════════════════════════════ #
-def render_calendar(duty_df, val_dates, title, exam_dates=None, buffer_dates=None, sat_preassigned=None):
+def render_calendar(duty_df, val_dates, title, exam_dates=None, buffer_dates=None, sat_preassigned=None, sat_blocked_dates=None):
     st.markdown(f"#### {title}")
     if duty_df.empty:
         st.info("No slot data available.")
@@ -961,9 +961,10 @@ def render_calendar(duty_df, val_dates, title, exam_dates=None, buffer_dates=Non
     sg = duty_df.groupby(["Date", "Session"], as_index=False)["Required"].sum()
     duty_map = {(row["Date"].date(), str(row["Session"]).upper()): int(row["Required"])
                 for _, row in sg.iterrows()}
-    val_set    = set(val_dates)
-    exam_set   = set(exam_dates)   if exam_dates   else set()
-    buffer_set = set(buffer_dates) if buffer_dates else set()
+    val_set          = set(val_dates)
+    exam_set         = set(exam_dates)         if exam_dates         else set()
+    buffer_set       = set(buffer_dates)       if buffer_dates       else set()
+    sat_blocked_set  = set(sat_blocked_dates)  if sat_blocked_dates  else set()
     sat_pre_key = (sat_preassigned["date"], sat_preassigned["session"]) if sat_preassigned else None
     WD_ORDER = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
@@ -979,11 +980,15 @@ def render_calendar(duty_df, val_dates, title, exam_dates=None, buffer_dates=Non
         "<span style='background:#fef9c3;border:2px solid #f59e0b;border-radius:4px;"
         "padding:2px 8px;margin-right:6px'>📅 Your Saturday (Frozen)</span>"
     ) if sat_pre_key else ""
+    _sat_blk_legend = (
+        "<span style='background:#f1f5f9;border:1px solid #94a3b8;border-radius:4px;"
+        "padding:2px 8px;margin-right:6px'>🚷 Saturday (Not for your designation)</span>"
+    ) if sat_blocked_set else ""
     st.markdown(
         "<span style='font-size:.82rem'>"
         "<span style='background:#fce7f3;border:1px solid #f9a8d4;border-radius:4px;"
         "padding:2px 8px;margin-right:6px'>🩷 Valuation Locked</span>"
-        + _sat_legend + _exam_legend + _buf_legend +
+        + _sat_legend + _sat_blk_legend + _exam_legend + _buf_legend +
         "<span style='background:#fff;border:1px solid #cbd5e1;border-radius:4px;"
         "padding:2px 8px'>🔢 Number = duties required on that day/session</span>"
         "</span>", unsafe_allow_html=True)
@@ -1031,8 +1036,9 @@ def render_calendar(duty_df, val_dates, title, exam_dates=None, buffer_dates=Non
                     is_val    = dt in val_set
                     is_exam   = dt in exam_set
                     is_buffer = dt in buffer_set
-                    is_sat_pre = (sat_pre_key is not None and dt == sat_pre_key[0])
-                    is_sun    = dt.weekday() == 6
+                    is_sat_pre  = (sat_pre_key is not None and dt == sat_pre_key[0])
+                    is_sat_blk  = (dt in sat_blocked_set)
+                    is_sun      = dt.weekday() == 6
                     if is_val:
                         bg, color = "#fce7f3", "#be185d"
                         label = f"{dt.day} 🔒"
@@ -1045,6 +1051,9 @@ def render_calendar(duty_df, val_dates, title, exam_dates=None, buffer_dates=Non
                     elif is_sat_pre:
                         bg, color = "#fef9c3", "#92400e"
                         label = f"{dt.day} 📅"
+                    elif is_sat_blk:
+                        bg, color = "#f1f5f9", "#94a3b8"
+                        label = f"{dt.day} 🚷"
                     else:
                         bg    = "#fff"
                         color = "#94a3b8" if is_sun else "#0f172a"
@@ -1065,6 +1074,7 @@ def render_calendar(duty_df, val_dates, title, exam_dates=None, buffer_dates=Non
                     is_val    = dt in val_set
                     is_exam   = dt in exam_set
                     is_buffer = dt in buffer_set
+                    is_sat_blk_row = (dt in sat_blocked_set)
                     for sess in ["FN", "AN"]:
                         is_sat_cell = (sat_pre_key is not None
                                        and dt == sat_pre_key[0]
@@ -1080,6 +1090,8 @@ def render_calendar(duty_df, val_dates, title, exam_dates=None, buffer_dates=Non
                             bg      = "#fef9c3"
                             content = ("<span style='font-size:.7rem;font-weight:900;"
                                        "color:#92400e'>🔒YOU</span>")
+                        elif is_sat_blk_row:
+                            bg, content = "#f1f5f9", ""
                         elif req == 0:
                             bg, content = "#fff", ""
                         else:
@@ -2661,8 +2673,19 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
     sopts["DateOnly"] = sopts["Date"].dt.date
     fac_blackout_dates = FACULTY_BLACKOUT_CLEAN.get(fn_clean, set())   # n, n-1, n-2
     fac_exam_dates     = FACULTY_EXAM_DATES_CLEAN.get(fn_clean, set()) # exam day only (for highlight)
-    valid_d = sorted([d for d in sopts["DateOnly"].dropna().unique()
-                      if d not in val_s2 and d not in fac_blackout_dates])
+
+    # Determine if this designation is NOT allowed on Saturdays
+    _sat_blocked_desig = desig2 not in {"TA", "RA"}
+
+    # Saturday dates in the slot list — used for calendar highlight + selector filter
+    _all_sat_dates = {d for d in sopts["DateOnly"].dropna().unique() if d.weekday() == 5}
+
+    valid_d = sorted([
+        d for d in sopts["DateOnly"].dropna().unique()
+        if d not in val_s2
+        and d not in fac_blackout_dates
+        and not (_sat_blocked_desig and d.weekday() == 5)   # block Saturdays for P/ACP/SAP/AP3/AP2
+    ])
 
     if st.session_state.selected_faculty != sel_clean:
         st.session_state.selected_faculty = sel_clean
@@ -2762,6 +2785,27 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
   {_buf_note}
   <div style="font-size:.78rem;color:#b91c1c;margin-top:6px;border-top:1px solid #fca5a5;padding-top:5px">
     ⚠️ You have exams on the above dates. These and their buffer days are excluded from selection and allotment.
+  </div>
+</div>""", unsafe_allow_html=True)
+
+        # Saturday blocked notice for non-TA/RA designations
+        if _sat_blocked_desig and _all_sat_dates:
+            _sat_list = " &nbsp;·&nbsp; ".join(
+                f"<b>{d.strftime('%d-%m-%Y')}</b>" for d in sorted(_all_sat_dates)
+            )
+            st.markdown(f"""
+<div style="background:#f1f5f9;border:2px solid #94a3b8;border-radius:12px;
+            padding:12px 16px;margin:8px 0 12px 0">
+  <div style="font-size:.93rem;font-weight:800;color:#334155">
+    🚷 Saturday Duties — Not Applicable for Your Designation
+  </div>
+  <div style="font-size:.83rem;color:#475569;margin-top:5px">
+    Saturdays are reserved for TA/RA faculty only.
+    The following dates are <b>excluded</b> from your date selector and will not be allotted to you:
+  </div>
+  <div style="font-size:.82rem;color:#64748b;margin-top:6px;
+              border-top:1px solid #cbd5e1;padding-top:6px">
+    {_sat_list}
   </div>
 </div>""", unsafe_allow_html=True)
 
@@ -2902,7 +2946,8 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
         render_calendar(offline_df, val_s2, "Offline Duty Calendar",
                         exam_dates=fac_exam_dates,
                         buffer_dates=(fac_blackout_dates - fac_exam_dates),
-                        sat_preassigned=_pre_sat)
+                        sat_preassigned=_pre_sat,
+                        sat_blocked_dates=(_all_sat_dates if _sat_blocked_desig else set()))
 
 
 # ═══════════════════════════════════════════════════════════════ #
