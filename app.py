@@ -185,10 +185,12 @@ DESIG_FULL = {
 # ── Per-faculty designation overrides ───────────────────────────────────────
 # Use when the Supabase designation field is NULL/blank/incorrect for a faculty.
 # Key = exact faculty name (as stored in Supabase), Value = designation code
+# ── Per-faculty designation overrides (safety net) ──────────────────────────
+# Supabase already has correct values. This overrides at app level as backup.
+# Key = exact name as stored in Supabase | Value = designation code
 FACULTY_DESIG_OVERRIDE_RAW: dict = {
-    "Dr. Anjan Kumar Dash": "P",
-    # Add more overrides here as needed, e.g.:
-    # "Dr. Some Name": "ACP",
+    "Dr. Anjan Kumar Dash": "P",   # faculty_id C870 — DB already has 'professor'
+    # Add more if needed: "Name": "ACP"
 }
 DUTY_STRUCTURE = {"P": 3, "ACP": 6, "SAP": 6, "AP3": 9, "AP2": 9, "TA": 11, "RA": 11}
 
@@ -456,8 +458,10 @@ SAT_PREASSIGN_CLEAN = {clean(n) for n in _SAT_PREASSIGN_RAW}
 
 # Faculty receiving 5 duties; all others in the list get 4 duties
 _FIVE_DUTY_RAW = [
-    "Shri C. Frizil Kinsly", "Shri P. Sarathkumar", "Shri S. Manikandan",
-    "Shri S. Sabrish", "Shri P. Panneerselvam",
+    "Shri C. Frizil Kinsly",
+    "Shri P. Sarathkumar",
+    "Shri S. Manikandan",
+    "Shri S. Sabrish",
 ]
 FIVE_DUTY_CLEAN = {clean(n) for n in _FIVE_DUTY_RAW}
 
@@ -2631,7 +2635,7 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
     fn_clean  = clean(sel_name)
     min_d, _  = fac_duty_range(sel_name, desig2)
     if fn_clean in FIVE_DUTY_CLEAN:
-        req_cnt = 12    # Last 4 TA: 5 duties → 12 willingness options
+        req_cnt = 12    # 4 specific TA: 5 duties → 12 willingness options
     elif fn_clean in SAT_PREASSIGN_CLEAN:
         req_cnt = 11    # First 13 TA + RA: 4 duties → 11 willingness options
     else:
@@ -2695,7 +2699,14 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
             st.error(f"⚠️ Designation code '{desig2}' not recognised. "
                      f"Raw value in DB: '{frow.get('designation', '?')}'. Contact admin.")
             return
-        duties_label = str(min_d) if min_d else str(DESIG_RULES.get(desig2,(0,0,[]))[0])
+        # Duty count: check explicit lists first, then fac_duty_range, then DESIG_RULES
+        if fn_clean in FIVE_DUTY_CLEAN:
+            _duties_count = 5
+        elif fn_clean in SAT_PREASSIGN_CLEAN:
+            _duties_count = 4
+        else:
+            _duties_count = DESIG_RULES.get(desig2, DESIG_RULES["TA"])[0]
+        duties_label = str(_duties_count)
         st.write(f"**Duties to be Allotted:** {duties_label}")
         st.write(f"**Options to Select:** {req_cnt}")
 
