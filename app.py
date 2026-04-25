@@ -441,8 +441,19 @@ def pw_ensure_all(id_list: list):
 def clean(x):
     return str(x).strip().lower()
 
+# Honorific prefixes to strip for robust name matching
+_HONORIFICS = {"shri", "shri.", "ms", "ms.", "mr", "mr.", "dr", "dr.", "prof", "prof."}
+
+def _norm_name(name: str) -> str:
+    """Lowercase + strip leading honorifics (Shri, Ms, Dr, Prof etc.)
+    so that 'Shri C. Frizil Kinsly' and 'C. Frizil Kinsly' both → 'c. frizil kinsly'."""
+    parts = clean(name).split()
+    while parts and parts[0].rstrip('.') in _HONORIFICS:
+        parts = parts[1:]
+    return " ".join(parts)
+
 # Build clean-keyed lookup after clean() is available
-FACULTY_DESIG_OVERRIDE = {clean(k): v for k, v in FACULTY_DESIG_OVERRIDE_RAW.items()}
+FACULTY_DESIG_OVERRIDE = {_norm_name(k): v for k, v in FACULTY_DESIG_OVERRIDE_RAW.items()}
 
 # ── TA/RA duty-count group (4 or 5 duties, may select Saturday dates) ── #
 _SAT_PREASSIGN_RAW = [
@@ -454,7 +465,7 @@ _SAT_PREASSIGN_RAW = [
     "Shri P. Sarathkumar", "Shri C. Frizil Kinsly", "Shri Sudhakar S",
     "Shri N. Arun Kumar",
 ]
-SAT_PREASSIGN_CLEAN = {clean(n) for n in _SAT_PREASSIGN_RAW}
+SAT_PREASSIGN_CLEAN = {_norm_name(n) for n in _SAT_PREASSIGN_RAW}
 
 # Faculty receiving 5 duties; all others in the list get 4 duties
 _FIVE_DUTY_RAW = [
@@ -463,22 +474,22 @@ _FIVE_DUTY_RAW = [
     "Shri S. Manikandan",
     "Shri S. Sabrish",
 ]
-FIVE_DUTY_CLEAN = {clean(n) for n in _FIVE_DUTY_RAW}
+FIVE_DUTY_CLEAN = {_norm_name(n) for n in _FIVE_DUTY_RAW}
 
 # Per-faculty exam dates (raw, for display highlights in calendar & UI)
 FACULTY_EXAM_DATES_CLEAN: dict = {
-    clean("Shri. P. Vijay Guru"):       {datetime.date(2026, 5, 20)},
-    clean("Shri E. Ezekiel"):           {datetime.date(2026, 5, 11)},
-    clean("Shri S. Varadharajan"):      {datetime.date(2026, 5, 22)},
-    clean("Ms S. Kiruba Kari"):         {datetime.date(2026, 5, 11),
-                                         datetime.date(2026, 5, 31)},
-    clean("Shri V. Adhavan"):           {datetime.date(2026, 5, 11),
-                                         datetime.date(2026, 5, 31)},
-    clean("Shri V. Ramesh Srenyvasan"): {datetime.date(2026, 5, 11),
-                                         datetime.date(2026, 5, 31)},
-    clean("Shri S. Sabrish"):           {datetime.date(2026, 5, 22)},
-    clean("Shri P. Sarathkumar"):       {datetime.date(2026, 5, 18)},
-    clean("Shri N. Arun Kumar"):        {datetime.date(2026, 5, 26)},
+    _norm_name("Shri. P. Vijay Guru"):       {datetime.date(2026, 5, 20)},
+    _norm_name("Shri E. Ezekiel"):           {datetime.date(2026, 5, 11)},
+    _norm_name("Shri S. Varadharajan"):      {datetime.date(2026, 5, 22)},
+    _norm_name("Ms S. Kiruba Kari"):         {datetime.date(2026, 5, 11),
+                                              datetime.date(2026, 5, 31)},
+    _norm_name("Shri V. Adhavan"):           {datetime.date(2026, 5, 11),
+                                              datetime.date(2026, 5, 31)},
+    _norm_name("Shri V. Ramesh Srenyvasan"): {datetime.date(2026, 5, 11),
+                                              datetime.date(2026, 5, 31)},
+    _norm_name("Shri S. Sabrish"):           {datetime.date(2026, 5, 22)},
+    _norm_name("Shri P. Sarathkumar"):       {datetime.date(2026, 5, 18)},
+    _norm_name("Shri N. Arun Kumar"):        {datetime.date(2026, 5, 26)},
 }
 
 def _prev_working_day(d: datetime.date, steps: int) -> datetime.date:
@@ -508,8 +519,8 @@ FACULTY_BLACKOUT_CLEAN: dict = {
 
 def fac_duty_range(fn: str, desig: str) -> tuple:
     """Return (min_duties, max_duties) for a faculty member.
-    Overrides DESIG_RULES for the Saturday TA/RA group."""
-    fc = clean(fn)
+    Strips honorifics before matching so Supabase names match correctly."""
+    fc = _norm_name(fn)
     if fc in FIVE_DUTY_CLEAN:
         return 5, 5
     if fc in SAT_PREASSIGN_CLEAN:
@@ -1141,7 +1152,7 @@ def _load_core(log):
     fr["Designation"] = fr["designation"].astype(str).apply(_map_desig)
     # Apply per-faculty overrides
     for _i, _r in fr.iterrows():
-        _fc = clean(_r["Name"])
+        _fc = _norm_name(_r["Name"])
         if _fc in FACULTY_DESIG_OVERRIDE:
             fr.at[_i, "Designation"] = FACULTY_DESIG_OVERRIDE[_fc]
     fr["ID No."]      = fr["faculty_id"].astype(str).apply(_norm_id)
@@ -1303,7 +1314,7 @@ def _load_core(log):
         if sl["type"] not in allowed:                                        return False
         if sl["date"] in fac_val.get(fn, set()):                            return False
         # Per-faculty blackout dates (exam on that day etc.)
-        if clean(fn) in FACULTY_BLACKOUT_CLEAN and sl["date"] in FACULTY_BLACKOUT_CLEAN[clean(fn)]:
+        if _norm_name(fn) in FACULTY_BLACKOUT_CLEAN and sl["date"] in FACULTY_BLACKOUT_CLEAN[_norm_name(fn)]:
             return False
         if sl["date"].weekday() == 5 and d2 not in SAT_DESIG:              return False
         return True
@@ -2632,7 +2643,7 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
     desig2    = str(frow["Designation"]).strip().upper()
     val_d2    = valuation_dates_for(frow)
     val_s2    = set(val_d2)
-    fn_clean  = clean(sel_name)
+    fn_clean  = _norm_name(sel_name)
     min_d, _  = fac_duty_range(sel_name, desig2)
     if fn_clean in FIVE_DUTY_CLEAN:
         req_cnt = 12    # 4 specific TA: 5 duties → 12 willingness options
@@ -2649,8 +2660,8 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
     sopts = offline_df.copy()
     sopts["Date"]     = pd.to_datetime(sopts["Date"], errors="coerce")
     sopts["DateOnly"] = sopts["Date"].dt.date
-    fac_blackout_dates = FACULTY_BLACKOUT_CLEAN.get(fn_clean, set())   # n, n-1, n-2
-    fac_exam_dates     = FACULTY_EXAM_DATES_CLEAN.get(fn_clean, set()) # exam day only (for highlight)
+    fac_blackout_dates = FACULTY_BLACKOUT_CLEAN.get(_norm_name(sel_name), set())
+    fac_exam_dates     = FACULTY_EXAM_DATES_CLEAN.get(_norm_name(sel_name), set())
 
     # Determine if this designation is NOT allowed on Saturdays
     _sat_blocked_desig = desig2 not in {"TA", "RA"}
@@ -2699,7 +2710,7 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
             st.error(f"⚠️ Designation code '{desig2}' not recognised. "
                      f"Raw value in DB: '{frow.get('designation', '?')}'. Contact admin.")
             return
-        # Duty count: check explicit lists first, then fac_duty_range, then DESIG_RULES
+        # Duty count: check explicit lists first, then DESIG_RULES
         if fn_clean in FIVE_DUTY_CLEAN:
             _duties_count = 5
         elif fn_clean in SAT_PREASSIGN_CLEAN:
@@ -2922,7 +2933,7 @@ def main():
         df["Designation"] = df["designation"].astype(str).apply(_map_desig)
         # Apply per-faculty overrides (handles NULL/blank Supabase values)
         for _i, _r in df.iterrows():
-            _fc = clean(_r["Name"])
+            _fc = _norm_name(_r["Name"])
             if _fc in FACULTY_DESIG_OVERRIDE:
                 df.at[_i, "Designation"] = FACULTY_DESIG_OVERRIDE[_fc]
         df["Clean"]       = df["Name"].apply(clean)
