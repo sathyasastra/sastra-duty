@@ -2445,24 +2445,7 @@ def page_admin(fac_df, offline_df, online_df):
                 set_gate(False); st.warning("Disabled."); st.rerun()
         st.caption("Workflow: Disable → Run Optimizer → Review → Enable.")
 
-        st.markdown("---")
-        st.markdown("#### 🗓️ Semester Setting")
-        _sem_options = [
-            "Auto-detect",
-            "Even Semester (May/Jun 2026 End-Semester)",
-            "Odd Semester (Nov/Dec End-Semester)",
-        ]
-        _cur_sem = st.session_state.get("semester_override", "Auto-detect")
-        _new_sem = st.selectbox(
-            "Semester Display Mode", _sem_options,
-            index=_sem_options.index(_cur_sem) if _cur_sem in _sem_options else 0,
-            key="sem_select")
-        if _new_sem != _cur_sem:
-            db_set_setting("semester_override", _new_sem)
-            st.session_state["semester_override"] = _new_sem
-            st.success(f"Semester set to: **{_new_sem}**"); st.rerun()
-        _pslot_dates = set(offline_df["Date"].dt.date.dropna())
-        st.caption(f"Currently showing: **{detect_semester(_pslot_dates)}**")
+
 
 
 # ═══════════════════════════════════════════════════════════════ #
@@ -2472,13 +2455,12 @@ def page_allotment(fac_df, sel_name, sel_clean, frow, offline_df, online_df):
     st.markdown("### My Allotment Details")
 
     _aslot_dates = set(offline_df["Date"].dt.date.dropna())
-    _asem = detect_semester(_aslot_dates)
     _as, _ae     = get_exam_period(_aslot_dates)
     if _as and _ae:
         st.markdown(
             f"<div style='background:#e0f2fe;border:1.5px solid #38bdf8;border-radius:10px;"
             f"padding:10px 16px;margin-bottom:12px;font-size:.93rem;color:#0c4a6e'>"
-            f"🎓 <b>{_asem}</b>&nbsp;&nbsp;|&nbsp;&nbsp; 📅 Exam Period: "
+            f"📅 <b>Exam Period:</b> "
             f"<b>{_as.strftime('%d-%m-%Y')} ({_as.strftime('%A')})</b>"
             f" → <b>{_ae.strftime('%d-%m-%Y')} ({_ae.strftime('%A')})</b>"
             f"</div>", unsafe_allow_html=True)
@@ -2626,20 +2608,19 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
 
     # Show exam period banner
     _slot_dates_user = set(offline_df["Date"].dt.date.dropna())
-    _sem_label       = detect_semester(_slot_dates_user)
     _exam_start, _exam_end = get_exam_period(_slot_dates_user)
 
     _period_str = ""
     if _exam_start and _exam_end:
         _period_str = (
-            f"&nbsp;&nbsp;|&nbsp;&nbsp; 📅 Exam Period: "
+            f"📅 <b>Exam Period:</b> "
             f"<b>{_exam_start.strftime('%d-%m-%Y')} ({_exam_start.strftime('%A')})</b>"
             f" → <b>{_exam_end.strftime('%d-%m-%Y')} ({_exam_end.strftime('%A')})</b>")
 
     st.markdown(
         f"<div style='background:#e0f2fe;border:1.5px solid #38bdf8;border-radius:10px;"
         f"padding:10px 16px;margin-bottom:4px;font-size:.93rem;color:#0c4a6e'>"
-        f"🎓 <b>{_sem_label}</b>{_period_str}</div>", unsafe_allow_html=True)
+        f"{_period_str}</div>", unsafe_allow_html=True)
 
     left, right = st.columns([1, 1.4])
 
