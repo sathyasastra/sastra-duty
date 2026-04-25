@@ -140,7 +140,7 @@ WILL_TAGS = {
     "Willingness-Exact", "Willingness-ACPOnline",
     "Willingness-SessionFlip", "Willingness-±1Day",
     "Willingness-±2Day", "Willingness-ValAdj",
-    "SAP-OnlineFallback", "Saturday-PreAssigned"
+    "SAP-OnlineFallback"
 }
 
 # ─── Page config ─────────────────────────────────────────────── #
@@ -363,7 +363,7 @@ def pw_ensure_all(id_list: list):
 def clean(x):
     return str(x).strip().lower()
 
-# ── Saturday TA/RA pre-assignment list ──────────────────────────── #
+# ── TA/RA duty-count group (4 or 5 duties, may select Saturday dates) ── #
 _SAT_PREASSIGN_RAW = [
     "Shri Sangeethkumar Gopaldas", "Shri S. Antony", "Shri S. Balamurli",
     "Shri R. Rajesh", "Shri. P. Vijay Guru", "Shri E. Ezekiel",
@@ -434,56 +434,6 @@ def fac_duty_range(fn: str, desig: str) -> tuple:
     dr = DESIG_RULES.get(desig, DESIG_RULES["TA"])
     return dr[0], dr[1]
 
-
-def _get_preassigned_saturday(fn_clean: str, offline_df, fac_df) -> dict | None:
-    """Deterministically compute the pre-assigned Saturday slot for a faculty member.
-    Uses alphabetical sort of cleaned names and round-robins across expanded Saturday slots.
-    Returns {"date": date, "session": str} or None."""
-    if fn_clean not in SAT_PREASSIGN_CLEAN:
-        return None
-
-    # Filter Saturday rows from offline_df
-    if offline_df.empty:
-        return None
-    _df = offline_df.copy()
-    _df["Date"] = pd.to_datetime(_df["Date"], errors="coerce")
-    sat_df = _df[_df["Date"].dt.weekday() == 5].sort_values(["Date", "Session"]).reset_index(drop=True)
-    if sat_df.empty:
-        return None
-
-    # Build sorted list of SAT_PREASSIGN faculty clean names present in fac_df
-    fac_clean_col = "Clean" if "Clean" in fac_df.columns else None
-    if fac_clean_col:
-        present = {r[fac_clean_col] for _, r in fac_df.iterrows()
-                   if r[fac_clean_col] in SAT_PREASSIGN_CLEAN}
-    else:
-        present = SAT_PREASSIGN_CLEAN  # fallback: use all known names
-    sat_fac_sorted = sorted(present)
-
-    # Expand each Saturday slot by its Required count
-    expanded = []
-    for _, row in sat_df.iterrows():
-        try:
-            req = max(int(float(str(row.get("Required", 1)))), 1)
-        except Exception:
-            req = 1
-        sess = str(row.get("Session", "FN")).strip().upper()
-        if sess not in ("FN", "AN"):
-            sess = "FN"
-        d = row["Date"]
-        if pd.isna(d):
-            continue
-        for _ in range(req):
-            expanded.append({"date": d.date(), "session": sess, "type": "Offline"})
-
-    if not expanded:
-        return None
-
-    # Assign round-robin: faculty[i] → expanded[i % len(expanded)]
-    for i, fc in enumerate(sat_fac_sorted):
-        if fc == fn_clean:
-            return expanded[i % len(expanded)]
-    return None
 
 def normalize_session(v):
     t = str(v).strip().upper()
@@ -795,10 +745,6 @@ def classify_duty(alloc_by: str, duty_date, duty_sess: str, will_set: set):
         return ("Valuation-Adjacent", "🗓️",
                 f"Allotted on a weekday adjacent to your valuation date "
                 f"({duty_date.strftime('%d-%m-%Y')} {duty_sess})", True)
-    if ab == "Saturday-PreAssigned":
-        return ("Saturday Pre-Assigned", "📅",
-                f"Saturday duty pre-assigned — {duty_date.strftime('%d-%m-%Y')} {duty_sess}",
-                True)
     if ab in ("Auto-Assigned", "Gap-Fill") or ab.startswith("Gap-Fill"):
         return ("Auto-Assigned", "⚙️",
                 "No willingness submitted — system assigned this duty to meet slot requirements",
@@ -871,7 +817,6 @@ def render_deviation_section(allot_rows: pd.DataFrame, will_set: set):
         "Date Adjusted (±2 days)":  ("#ffe4e6", "#881337"),
         "Valuation-Adjacent":       ("#ede9fe", "#5b21b6"),
         "Not in Willingness":       ("#fee2e2", "#991b1b"),
-        "Saturday Pre-Assigned":    ("#fef9c3", "#92400e"),
         "Auto-Assigned":            ("#e5e7eb", "#374151"),
     }
     rows_html = ""
@@ -945,7 +890,7 @@ def render_deviation_section(allot_rows: pd.DataFrame, will_set: set):
 # ═══════════════════════════════════════════════════════════════ #
 #                    CALENDAR HEATMAP                            #
 # ═══════════════════════════════════════════════════════════════ #
-def render_calendar(duty_df, val_dates, title, exam_dates=None, buffer_dates=None, sat_preassigned=None, sat_blocked_dates=None):
+def render_calendar(duty_df, val_dates, title, exam_dates=None, buffer_dates=None, sat_blocked_dates=None):
     st.markdown(f"#### {title}")
     if duty_df.empty:
         st.info("No slot data available.")
@@ -965,7 +910,6 @@ def render_calendar(duty_df, val_dates, title, exam_dates=None, buffer_dates=Non
     exam_set         = set(exam_dates)         if exam_dates         else set()
     buffer_set       = set(buffer_dates)       if buffer_dates       else set()
     sat_blocked_set  = set(sat_blocked_dates)  if sat_blocked_dates  else set()
-    sat_pre_key = (sat_preassigned["date"], sat_preassigned["session"]) if sat_preassigned else None
     WD_ORDER = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
     _exam_legend = (
@@ -976,10 +920,6 @@ def render_calendar(duty_df, val_dates, title, exam_dates=None, buffer_dates=Non
         "<span style='background:#ffedd5;border:1px solid #fdba74;border-radius:4px;"
         "padding:2px 8px;margin-right:6px'>⛔ Buffer Day (n−1, n−2)</span>"
     ) if buffer_set else ""
-    _sat_legend = (
-        "<span style='background:#fef9c3;border:2px solid #f59e0b;border-radius:4px;"
-        "padding:2px 8px;margin-right:6px'>📅 Your Saturday (Frozen)</span>"
-    ) if sat_pre_key else ""
     _sat_blk_legend = (
         "<span style='background:#f1f5f9;border:1px solid #94a3b8;border-radius:4px;"
         "padding:2px 8px;margin-right:6px'>🚷 Saturday (Not for your designation)</span>"
@@ -988,7 +928,7 @@ def render_calendar(duty_df, val_dates, title, exam_dates=None, buffer_dates=Non
         "<span style='font-size:.82rem'>"
         "<span style='background:#fce7f3;border:1px solid #f9a8d4;border-radius:4px;"
         "padding:2px 8px;margin-right:6px'>🩷 Valuation Locked</span>"
-        + _sat_legend + _sat_blk_legend + _exam_legend + _buf_legend +
+        + _sat_blk_legend + _exam_legend + _buf_legend +
         "<span style='background:#fff;border:1px solid #cbd5e1;border-radius:4px;"
         "padding:2px 8px'>🔢 Number = duties required on that day/session</span>"
         "</span>", unsafe_allow_html=True)
@@ -1036,7 +976,6 @@ def render_calendar(duty_df, val_dates, title, exam_dates=None, buffer_dates=Non
                     is_val    = dt in val_set
                     is_exam   = dt in exam_set
                     is_buffer = dt in buffer_set
-                    is_sat_pre  = (sat_pre_key is not None and dt == sat_pre_key[0])
                     is_sat_blk  = (dt in sat_blocked_set)
                     is_sun      = dt.weekday() == 6
                     if is_val:
@@ -1048,9 +987,6 @@ def render_calendar(duty_df, val_dates, title, exam_dates=None, buffer_dates=Non
                     elif is_buffer:
                         bg, color = "#ffedd5", "#c2410c"
                         label = f"{dt.day} ⛔"
-                    elif is_sat_pre:
-                        bg, color = "#fef9c3", "#92400e"
-                        label = f"{dt.day} 📅"
                     elif is_sat_blk:
                         bg, color = "#f1f5f9", "#94a3b8"
                         label = f"{dt.day} 🚷"
@@ -1076,9 +1012,6 @@ def render_calendar(duty_df, val_dates, title, exam_dates=None, buffer_dates=Non
                     is_buffer = dt in buffer_set
                     is_sat_blk_row = (dt in sat_blocked_set)
                     for sess in ["FN", "AN"]:
-                        is_sat_cell = (sat_pre_key is not None
-                                       and dt == sat_pre_key[0]
-                                       and sess == sat_pre_key[1])
                         req = duty_map.get((dt, sess), 0)
                         if is_val:
                             bg, content = "#fce7f3", ""
@@ -1086,10 +1019,6 @@ def render_calendar(duty_df, val_dates, title, exam_dates=None, buffer_dates=Non
                             bg, content = "#fee2e2", ""
                         elif is_buffer:
                             bg, content = "#ffedd5", ""
-                        elif is_sat_cell:
-                            bg      = "#fef9c3"
-                            content = ("<span style='font-size:.7rem;font-weight:900;"
-                                       "color:#92400e'>🔒YOU</span>")
                         elif is_sat_blk_row:
                             bg, content = "#f1f5f9", ""
                         elif req == 0:
@@ -1295,26 +1224,6 @@ def _load_core(log):
     # ── Per-faculty duty ranges ───────────────────────────────────────
     fac_duties = {fn: fac_duty_range(fn, fac_d.get(fn, "TA")) for fn in ALL_FAC}
 
-    # ── Saturday pre-assignments (deterministic, greedy) ─────────────
-    sat_slots_sorted = sorted(
-        [s for s in ALL_S if s["date"].weekday() == 5],
-        key=lambda s: (s["date"], s["session"]))
-    sat_fac_sorted = sorted(
-        [fn for fn in ALL_FAC if clean(fn) in SAT_PREASSIGN_CLEAN],
-        key=lambda fn: clean(fn))
-    sat_preassign: dict = {}
-    _slot_usage_sat: dict = defaultdict(int)
-    for _fn in sat_fac_sorted:
-        for _sl in sat_slots_sorted:
-            _key = (_sl["date"], _sl["session"])
-            if _slot_usage_sat[_key] < _sl["required"] and is_eligible(_fn, _sl):
-                sat_preassign[_fn] = _sl
-                _slot_usage_sat[_key] += 1
-                break
-    log(f"  Saturday pre-assigned : {len(sat_preassign)} / {len(sat_fac_sorted)} faculty")
-    for _fn, _sl in sat_preassign.items():
-        log(f"    {_fn:<38} → {_sl['date'].strftime('%d-%m-%Y')} {_sl['session']}")
-
     return dict(
         fr=fr, ALL_FAC=ALL_FAC, FAC_IDX=FAC_IDX, N_FAC=N_FAC,
         fac_d=fac_d, dgroups=dgroups, fac_val=fac_val,
@@ -1324,7 +1233,7 @@ def _load_core(log):
         fexp=fexp, tag=tag, is_eligible=is_eligible,
         sap_fallback=sap_fallback, SAT_DESIG=SAT_DESIG,
         acp_2online=acp_2online, acp_2offline=acp_2offline,
-        sat_preassign=sat_preassign, fac_duties=fac_duties,
+        fac_duties=fac_duties,
     )
 
 
@@ -1429,17 +1338,6 @@ def _greedy_solve(core, log):
         return (sc, -alloc_count[fn], -DESIG_PRIORITY.get(fac_d[fn], 0))
 
     assigned = []
-    # ── Saturday pre-assignments: fixed before optimizer ─────────────
-    _sat_pre = core.get("sat_preassign", {})
-    for _fn, _sl in _sat_pre.items():
-        assigned.append({"Name": _fn, "Date": _sl["date"],
-                         "Session": _sl["session"], "Type": _sl["type"],
-                         "Allocated_By": "Saturday-PreAssigned"})
-        alloc_count[_fn] += 1
-        used_dt_sess[_fn].add((_sl["date"], _sl["session"]))
-        if fac_d.get(_fn) == "ACP" and _sl["type"] == "Offline":
-            acp_offline[_fn] += 1
-
     for sl in sorted(ALL_S, key=lambda s: -s["required"]):
         needed = sl["required"]
         cands  = sorted([fn for fn in ALL_FAC if eligible(fn, sl)],
@@ -1564,15 +1462,7 @@ def _cpsat_solve(core, log):
             fi = FAC_IDX[fn]
             if off_i: mdl.Add(sum(x[(fi, si)] for si in off_i) <= 2)
 
-        # Fix Saturday pre-assignments
-        _sat_pre_cp = core.get("sat_preassign", {})
-        for _fn, _sl in _sat_pre_cp.items():
-            _fi = FAC_IDX.get(_fn)
-            if _fi is None: continue
-            _si = next((i for i, s in enumerate(ALL_S)
-                        if s["date"] == _sl["date"] and s["session"] == _sl["session"]), None)
-            if _si is not None:
-                mdl.Add(x[(_fi, _si)] == 1)
+
 
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds  = 300
@@ -1692,16 +1582,6 @@ def _milp_solve(core, log):
         if off_i:
             add_con([v(fi,si) for si in off_i], [1]*len(off_i), 0, 2)
 
-    # Fix Saturday pre-assignments (lower bound = 1)
-    _sat_pre_milp = core.get("sat_preassign", {})
-    for _fn, _sl in _sat_pre_milp.items():
-        _fi = FAC_IDX.get(_fn)
-        if _fi is None: continue
-        _si = next((i for i, s in enumerate(ALL_S)
-                    if s["date"] == _sl["date"] and s["session"] == _sl["session"]), None)
-        if _si is not None:
-            lb[v(_fi, _si)] = 1.0
-
     from scipy.sparse import csc_matrix
     A = csc_matrix((dA, (rA, cA)), shape=(nc[0], NV))
     log(f"  Variables    : {NV}  Constraints: {nc[0]}")
@@ -1767,7 +1647,6 @@ def _log_result(assigned, core, method, log):
     log(f"  RESULT  [{method}]")
     log(f"  {'='*54}")
     log(f"  Total assignments   : {tot}")
-    log(f"  ├─ Saturday pre-fix : {int((ab2=='Saturday-PreAssigned').sum())}")
     log(f"  ├─ Exact            : {int((ab2=='Willingness-Exact').sum())}")
     log(f"  ├─ Session flip     : {int((ab2=='Willingness-SessionFlip').sum())}")
     log(f"  ├─ ±1 day           : {int((ab2=='Willingness-±1Day').sum())}")
@@ -2655,11 +2534,10 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
     val_s2    = set(val_d2)
     fn_clean  = clean(sel_name)
     min_d, _  = fac_duty_range(sel_name, desig2)
-    has_sat   = fn_clean in SAT_PREASSIGN_CLEAN
     if fn_clean in FIVE_DUTY_CLEAN:
-        req_cnt = 12    # Last 4 TA: 5 duties, 1 Saturday locked → 12 willingness options
+        req_cnt = 12    # Last 4 TA: 5 duties → 12 willingness options
     elif fn_clean in SAT_PREASSIGN_CLEAN:
-        req_cnt = 11    # First 13 TA + RA: 4 duties, 1 Saturday locked → 11 willingness options
+        req_cnt = 11    # First 13 TA + RA: 4 duties → 11 willingness options
     else:
         req_cnt = DUTY_STRUCTURE.get(desig2, 0)
 
@@ -2713,47 +2591,13 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
 
     left, right = st.columns([1, 1.4])
 
-    # Compute Saturday pre-assignment once (used in both left panel and calendar)
-    _pre_sat = _get_preassigned_saturday(fn_clean, offline_df, fac_df) if has_sat else None
-
     with left:
         st.subheader("Willingness Submission")
-
-        # ── Saturday Pre-Assignment — show FIRST and prominently ──────────────
-        if has_sat:
-            if _pre_sat:
-                _sat_str  = _pre_sat["date"].strftime("%d-%m-%Y (%A)")
-                _sat_sess = _pre_sat["session"]
-                st.markdown(f"""
-<div style="background:#fef9c3;border:3px solid #f59e0b;border-radius:14px;
-            padding:14px 18px;margin-bottom:14px">
-  <div style="font-size:1rem;font-weight:800;color:#92400e;margin-bottom:6px">
-    📅 Saturday Duty — Pre-Assigned &amp; Frozen
-  </div>
-  <div style="background:#fff7ed;border-radius:8px;padding:10px 14px;margin:6px 0">
-    <span style="font-size:1.05rem;font-weight:900;color:#b45309">
-      🗓️ {_sat_str}
-    </span>
-    &nbsp;&nbsp;
-    <span style="background:#92400e;color:#fff;border-radius:6px;
-                 padding:3px 12px;font-weight:800;font-size:.95rem">
-      {_sat_sess}
-    </span>
-  </div>
-  <div style="font-size:.82rem;color:#a16207;margin-top:8px;
-              border-top:1px solid #fcd34d;padding-top:7px">
-    🔒 This Saturday slot is <b>locked and already counted</b> as one of your duties.
-    You need to submit willingness for the remaining <b>{req_cnt}</b> dates below.
-  </div>
-</div>""", unsafe_allow_html=True)
-            else:
-                st.warning("⚠️ Saturday duty could not be computed — no Saturday slots found in the exam schedule. Contact admin.")
 
         st.write(f"**Designation:** {DESIG_FULL.get(desig2, desig2)}")
         duties_label = str(min_d) if min_d else str(DESIG_RULES.get(desig2,(0,0,[]))[0])
         st.write(f"**Duties to be Allotted:** {duties_label}")
-        st.write(f"**Options to Select (excl. Saturday):** {req_cnt}" if has_sat
-                 else f"**Options to Select:** {req_cnt}")
+        st.write(f"**Options to Select:** {req_cnt}")
 
         # Exam date notice (only for faculty with exam dates)
         if fac_exam_dates:
@@ -2946,7 +2790,6 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
         render_calendar(offline_df, val_s2, "Offline Duty Calendar",
                         exam_dates=fac_exam_dates,
                         buffer_dates=(fac_blackout_dates - fac_exam_dates),
-                        sat_preassigned=_pre_sat,
                         sat_blocked_dates=(_all_sat_dates if _sat_blocked_desig else set()))
 
 
