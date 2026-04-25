@@ -83,18 +83,85 @@ ADMIN_IDS        = {"C2086"}  # Faculty IDs that are always admin
 # ─── Designation rules ───────────────────────────────────────── #
 # Map raw Excel designation strings → internal codes
 DESIG_MAP = {
-    "professor":          "P",
-    "acp":                "ACP",
-    "sap":                "SAP",
-    "ap 3":               "AP3",
-    "ap3":                "AP3",
-    "ap 2":               "AP2",
-    "ap2":                "AP2",
-    "teaching assistant": "TA",
-    "ta":                 "TA",
-    "research assistant": "RA",
-    "ra":                 "RA",
+    # Professor
+    "professor":                    "P",
+    "prof":                         "P",
+    "prof.":                        "P",
+    "p":                            "P",
+    # Associate Professor
+    "acp":                          "ACP",
+    "associate professor":          "ACP",
+    "assoc. professor":             "ACP",
+    "assoc professor":              "ACP",
+    # Senior Assistant Professor
+    "sap":                          "SAP",
+    "senior assistant professor":   "SAP",
+    "sr. assistant professor":      "SAP",
+    "sr assistant professor":       "SAP",
+    # Assistant Professor Grade III / AP3
+    "ap 3":                         "AP3",
+    "ap3":                          "AP3",
+    "ap-3":                         "AP3",
+    "ap iii":                       "AP3",
+    "assistant professor 3":        "AP3",
+    "assistant professor iii":      "AP3",
+    "assistant professor grade 3":  "AP3",
+    "assistant professor grade iii":"AP3",
+    "assistant professor - iii":    "AP3",
+    "assistant professor - 3":      "AP3",
+    "asst. professor 3":            "AP3",
+    "asst professor 3":             "AP3",
+    # Assistant Professor Grade II / AP2
+    "ap 2":                         "AP2",
+    "ap2":                          "AP2",
+    "ap-2":                         "AP2",
+    "ap ii":                        "AP2",
+    "assistant professor 2":        "AP2",
+    "assistant professor ii":       "AP2",
+    "assistant professor grade 2":  "AP2",
+    "assistant professor grade ii": "AP2",
+    "assistant professor - ii":     "AP2",
+    "assistant professor - 2":      "AP2",
+    "asst. professor 2":            "AP2",
+    "asst professor 2":             "AP2",
+    # Teaching Assistant
+    "teaching assistant":           "TA",
+    "ta":                           "TA",
+    # Research Assistant
+    "research assistant":           "RA",
+    "ra":                           "RA",
 }
+
+def _map_desig(raw: str) -> str:
+    """Map a raw designation string to a DESIG_MAP code.
+    Falls back to substring/keyword matching before defaulting to TA."""
+    s = str(raw).strip().lower()
+    # Exact match first
+    if s in DESIG_MAP:
+        return DESIG_MAP[s]
+    # Already a known code (e.g. stored as "P", "ACP" etc.)
+    up = s.upper()
+    if up in ("P", "ACP", "SAP", "AP3", "AP2", "TA", "RA"):
+        return up
+    # Keyword fallback
+    if "research assistant" in s or s == "ra":
+        return "RA"
+    if "teaching assistant" in s or s == "ta":
+        return "TA"
+    if "senior assistant" in s or "sr" in s.split():
+        return "SAP"
+    if "associate" in s:
+        return "ACP"
+    if "professor" in s or "prof" in s:
+        # Try to detect grade/level
+        for token in s.replace("-", " ").split():
+            if token in ("3", "iii", "grade3", "gradeiii"):
+                return "AP3"
+            if token in ("2", "ii", "grade2", "gradeii"):
+                return "AP2"
+        return "P"   # Plain "professor" → P
+    # Last resort
+    return "TA"
 # Option B: Online duty suspended — all designations use Offline only
 DESIG_RULES = {
     "P":   (1, 1, ["Offline"]),   # Online duty suspended this semester
@@ -113,6 +180,15 @@ DESIG_FULL = {
     "AP2": "Assistant Professor - II",
     "TA":  "Teaching Assistant",
     "RA":  "Research Assistant",
+}
+
+# ── Per-faculty designation overrides ───────────────────────────────────────
+# Use when the Supabase designation field is NULL/blank/incorrect for a faculty.
+# Key = clean(faculty_name), Value = designation code ("P","ACP","SAP","AP3","AP2","TA","RA")
+FACULTY_DESIG_OVERRIDE: dict = {
+    clean("Dr. Anjan Kumar Dash"): "P",
+    # Add more overrides here as needed, e.g.:
+    # clean("Dr. Some Name"): "ACP",
 }
 DUTY_STRUCTURE = {"P": 3, "ACP": 6, "SAP": 6, "AP3": 9, "AP2": 9, "TA": 11, "RA": 11}
 
@@ -1055,8 +1131,12 @@ def _load_core(log):
         raise RuntimeError("No faculty found in Supabase.")
     fr = pd.DataFrame(fac_rows)
     fr["Name"]        = fr["name"].astype(str).str.strip()
-    fr["Designation"] = (fr["designation"].astype(str).str.strip()
-                         .apply(lambda x: DESIG_MAP.get(x.lower(), x.upper())))
+    fr["Designation"] = fr["designation"].astype(str).apply(_map_desig)
+    # Apply per-faculty overrides
+    for _i, _r in fr.iterrows():
+        _fc = clean(_r["Name"])
+        if _fc in FACULTY_DESIG_OVERRIDE:
+            fr.at[_i, "Designation"] = FACULTY_DESIG_OVERRIDE[_fc]
     fr["ID No."]      = fr["faculty_id"].astype(str).apply(_norm_id)
     fr = fr.dropna(subset=["Name"]).reset_index(drop=True)
 
@@ -2288,11 +2368,15 @@ def page_admin(fac_df, offline_df, online_df):
         acc_rows = []
         for r in all_fac_rows:
             acc_rows.append({
-                "ID No.":      r["faculty_id"],
-                "Name":        r["name"],
-                "Designation": r["designation"],
-                "Must Change": "⚠ Yes" if r.get("must_change_pw") else "No",
-                "Is Admin":    "👑 Yes" if r.get("is_admin") else "No",
+                "ID No.":          r["faculty_id"],
+                "Name":            r["name"],
+                "Raw Designation": r["designation"],
+                "Resolved Code":   _map_desig(r["designation"]) if clean(r["name"]) not in FACULTY_DESIG_OVERRIDE
+                                   else f"{FACULTY_DESIG_OVERRIDE[clean(r['name'])]} ⚠️override",
+                "Full Name":       DESIG_FULL.get(_map_desig(r["designation"]), "Unknown") if clean(r["name"]) not in FACULTY_DESIG_OVERRIDE
+                                   else DESIG_FULL.get(FACULTY_DESIG_OVERRIDE[clean(r["name"])], "Unknown"),
+                "Must Change":     "⚠ Yes" if r.get("must_change_pw") else "No",
+                "Is Admin":        "👑 Yes" if r.get("is_admin") else "No",
             })
         acc_df = pd.DataFrame(acc_rows)
         acc_df.insert(0, "Sl.No", acc_df.index + 1)
@@ -2401,6 +2485,15 @@ def page_admin(fac_df, offline_df, online_df):
                          disabled=not is_open):
                 set_gate(False); st.warning("Disabled."); st.rerun()
         st.caption("Workflow: Disable → Run Optimizer → Review → Enable.")
+
+        st.markdown("---")
+        st.markdown("#### 🔄 Clear App Cache")
+        st.caption("Forces a reload of faculty, slots, and willingness data from Supabase. "
+                   "Use after updating designations in Supabase or after applying overrides.")
+        if st.button("🔄 Clear All Cached Data", use_container_width=True):
+            st.cache_data.clear()
+            st.success("✅ Cache cleared — all data will reload fresh from Supabase.")
+            st.rerun()
 
 
 
@@ -2595,6 +2688,10 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
         st.subheader("Willingness Submission")
 
         st.write(f"**Designation:** {DESIG_FULL.get(desig2, desig2)}")
+        if desig2 not in DESIG_RULES:
+            st.error(f"⚠️ Designation code '{desig2}' not recognised. "
+                     f"Raw value in DB: '{frow.get('designation', '?')}'. Contact admin.")
+            return
         duties_label = str(min_d) if min_d else str(DESIG_RULES.get(desig2,(0,0,[]))[0])
         st.write(f"**Duties to be Allotted:** {duties_label}")
         st.write(f"**Options to Select:** {req_cnt}")
@@ -2808,7 +2905,12 @@ def main():
         df["ID No."]      = df["faculty_id"].astype(str).apply(_norm_id)
         df["Name"]        = df["name"].astype(str).str.strip()
         df["NAME OF STAFF"] = df["Name"]
-        df["Designation"] = df["designation"].astype(str).str.strip().str.lower().map(DESIG_MAP).fillna("TA")
+        df["Designation"] = df["designation"].astype(str).apply(_map_desig)
+        # Apply per-faculty overrides (handles NULL/blank Supabase values)
+        for _i, _r in df.iterrows():
+            _fc = clean(_r["Name"])
+            if _fc in FACULTY_DESIG_OVERRIDE:
+                df.at[_i, "Designation"] = FACULTY_DESIG_OVERRIDE[_fc]
         df["Clean"]       = df["Name"].apply(clean)
         for col in ["v1","v2","v3","v4","v5"]:
             cap = col.upper()
