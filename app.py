@@ -482,11 +482,11 @@ FACULTY_EXAM_DATES_CLEAN: dict = {
     _norm_name("Shri E. Ezekiel"):           {datetime.date(2026, 5, 11)},
     _norm_name("Shri S. Varadharajan"):      {datetime.date(2026, 5, 22)},
     _norm_name("Ms S. Kiruba Kari"):         {datetime.date(2026, 5, 11),
-                                              datetime.date(2026, 5, 31)},
+                                              datetime.date(2026, 5, 13)},
     _norm_name("Shri V. Adhavan"):           {datetime.date(2026, 5, 11),
-                                              datetime.date(2026, 5, 31)},
+                                              datetime.date(2026, 5, 13)},
     _norm_name("Shri V. Ramesh Srenyvasan"): {datetime.date(2026, 5, 11),
-                                              datetime.date(2026, 5, 31)},
+                                              datetime.date(2026, 5, 13)},
     _norm_name("Shri S. Sabrish"):           {datetime.date(2026, 5, 22)},
     _norm_name("Shri P. Sarathkumar"):       {datetime.date(2026, 5, 18)},
     _norm_name("Shri N. Arun Kumar"):        {datetime.date(2026, 5, 26)},
@@ -563,11 +563,27 @@ def demand_category(req: int) -> str:
     return "High (>7)"
 
 def valuation_dates_for(row):
-    return sorted({
-        pd.to_datetime(row[c], dayfirst=True).date()
-        for c in ["V1", "V2", "V3", "V4", "V5"]
-        if c in row.index and pd.notna(row[c])
-    })
+    dates = set()
+    for c in ["V1", "V2", "V3", "V4", "V5"]:
+        if c not in row.index:
+            continue
+        val = row[c]
+        if val is None or (hasattr(val, '__class__') and val.__class__.__name__ == 'NaTType'):
+            continue
+        try:
+            if pd.isna(val):
+                continue
+        except Exception:
+            pass
+        try:
+            ts = pd.to_datetime(val, dayfirst=False, errors="coerce")   # Supabase stores ISO
+            if pd.isna(ts):
+                ts = pd.to_datetime(val, dayfirst=True, errors="coerce") # fallback DD-MM-YYYY
+            if pd.notna(ts):
+                dates.add(ts.date())
+        except Exception:
+            pass
+    return sorted(dates)
 
 def qp_dates_for(row):
     return sorted({
@@ -593,23 +609,30 @@ def wa_link(phone, msg):
     return f"https://wa.me/{p}?text={urllib.parse.quote(msg)}"
 
 def build_msg(name, will, val, inv, qp, match_str="", dev_lines=None):
+    val_note = "  (Full day — scheduled after exam period ends)" if val and val != ["Not available"] else ""
     lines = [
-        f"Dear {name},", "",
-        "Examination Duty Details:", "",
-        "1) Invigilation Dates (Final Allotment):",
-        *(inv or ["Not allotted yet"]), "",
-        "2) Valuation Dates (Full Day):",
-        *(val or ["Not available"]), "",
+        f"Dear {name},",
+        "",
+        "Examination Duty Details — SASTRA SoME:",
+        "",
+        "1) Invigilation Duty Dates (Final Allotment):",
+        *(inv or ["  Not allotted yet"]),
+        "",
+        f"2) Valuation Dates:{val_note}",
+        *(val or ["  Not available"]),
+        "",
         "3) QP Feedback Dates:",
-        *(qp or ["Not available"]), "",
+        *(qp or ["  Not available"]),
+        "",
     ]
     if match_str:
         lines += [
             "4) Willingness Match Summary:",
             f"   {match_str}",
-            *(dev_lines or []), "",
+            *(dev_lines or []),
+            "",
         ]
-    lines.append("- SASTRA SoME Examination Committee")
+    lines.append("— SASTRA SoME Examination Committee")
     return "\n".join(lines)
 
 def detect_semester(slot_dates=None):
