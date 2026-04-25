@@ -632,7 +632,6 @@ def wa_link(phone, msg):
     return f"https://wa.me/{p}?text={urllib.parse.quote(msg)}"
 
 def build_msg(name, will, val, inv, qp, match_str="", dev_lines=None):
-    val_note = "  (Full day — scheduled after exam period ends)" if val and val != ["Not available"] else ""
     lines = [
         f"Dear {name},",
         "",
@@ -641,7 +640,7 @@ def build_msg(name, will, val, inv, qp, match_str="", dev_lines=None):
         "1) Invigilation Duty Dates (Final Allotment):",
         *(inv or ["  Not allotted yet"]),
         "",
-        f"2) Valuation Dates:{val_note}",
+        "2) Valuation Dates (Full Day):",
         *(val or ["  Not available"]),
         "",
         "3) QP Feedback Dates:",
@@ -1461,6 +1460,13 @@ def _greedy_solve(core, log):
     acp_online   = defaultdict(int)
     acp_offline  = defaultdict(int)
 
+    # Shuffle faculty order with fixed seed — removes alphabetical tie-breaking bias
+    # while keeping results reproducible across runs
+    import random as _random
+    _rng = _random.Random(42)
+    ALL_FAC_SHUFFLED = ALL_FAC[:]
+    _rng.shuffle(ALL_FAC_SHUFFLED)
+
     def rem(fn):
         _, max_d = fac_duty_range(fn, fac_d.get(fn, "TA"))
         return max_d - alloc_count[fn]
@@ -1479,12 +1485,15 @@ def _greedy_solve(core, log):
     def score(fn, sl):
         k  = (sl["date"], sl["session"], sl["type"])
         sc = fexp[fn].get(k, 0)
-        return (sc, -alloc_count[fn], -DESIG_PRIORITY.get(fac_d[fn], 0))
+        min_d, _ = fac_duty_range(fn, fac_d.get(fn, "TA"))
+        # Equity: prioritise faculty with fewer duties filled relative to their target
+        filled_ratio = alloc_count[fn] / min_d if min_d > 0 else 1.0
+        return (sc, -filled_ratio)
 
     assigned = []
     for sl in sorted(ALL_S, key=lambda s: -s["required"]):
         needed = sl["required"]
-        cands  = sorted([fn for fn in ALL_FAC if eligible(fn, sl)],
+        cands  = sorted([fn for fn in ALL_FAC_SHUFFLED if eligible(fn, sl)],
                         key=lambda fn: score(fn, sl), reverse=True)
         for fn in cands[:needed]:
             k  = (sl["date"], sl["session"], sl["type"])
@@ -1501,7 +1510,7 @@ def _greedy_solve(core, log):
                      if a["Date"]==sl["date"] and a["Session"]==sl["session"] and a["Type"]==sl["type"])
         if filled < needed:
             extras = sorted(
-                [fn for fn in ALL_FAC
+                [fn for fn in ALL_FAC_SHUFFLED
                  if is_eligible(fn, sl) and (sl["date"],sl["session"]) not in used_dt_sess[fn]
                  and fn not in [a["Name"] for a in assigned
                                 if a["Date"]==sl["date"] and a["Session"]==sl["session"] and a["Type"]==sl["type"]]],
@@ -1515,7 +1524,7 @@ def _greedy_solve(core, log):
                 alloc_count[fn] += 1
                 used_dt_sess[fn].add((sl["date"], sl["session"]))
 
-    for fn in ALL_FAC:
+    for fn in ALL_FAC_SHUFFLED:
         min_d, _ = fac_duty_range(fn, fac_d.get(fn, "TA"))
         needed = min_d - alloc_count[fn]
         if needed <= 0: continue
@@ -1578,8 +1587,11 @@ def _cpsat_solve(core, log):
                 if not is_eligible(fn, sl): continue
                 k  = (sl["date"], sl["session"], sl["type"])
                 sc = fexp[fn].get(k, 0)
+                min_d, _ = fac_duty_range(fn, fac_d.get(fn, "TA"))
+                # Equity cap: scale score by 1/min_duties so no faculty dominates
+                equity_sc = int(sc / max(min_d, 1))
                 if sc > 0:
-                    obj_terms.append(sc * x[(fi, si)])
+                    obj_terms.append(equity_sc * x[(fi, si)])
                 elif fn in submitted:
                     obj_terms.append(-PENALTY * x[(fi, si)])
         for si in range(NS):
@@ -1679,8 +1691,10 @@ def _milp_solve(core, log):
                 ub[v(fi, si)] = 0.0; continue
             k  = (sl["date"], sl["session"], sl["type"])
             sc = fexp[fn].get(k, 0)
-            if sc > 0:
-                c_obj[v(fi, si)] = -float(sc)
+            min_d, _ = fac_duty_range(fn, fac_d.get(fn, "TA"))
+            equity_sc = sc / max(min_d, 1)  # scale so faculty with more duties don't dominate
+            if equity_sc > 0:
+                c_obj[v(fi, si)] = -float(equity_sc)
             elif fn in submitted:
                 c_obj[v(fi, si)] = float(PENALTY)
 
