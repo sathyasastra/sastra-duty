@@ -184,11 +184,11 @@ DESIG_FULL = {
 
 # ── Per-faculty designation overrides ───────────────────────────────────────
 # Use when the Supabase designation field is NULL/blank/incorrect for a faculty.
-# Key = clean(faculty_name), Value = designation code ("P","ACP","SAP","AP3","AP2","TA","RA")
-FACULTY_DESIG_OVERRIDE: dict = {
-    clean("Dr. Anjan Kumar Dash"): "P",
+# Key = exact faculty name (as stored in Supabase), Value = designation code
+FACULTY_DESIG_OVERRIDE_RAW: dict = {
+    "Dr. Anjan Kumar Dash": "P",
     # Add more overrides here as needed, e.g.:
-    # clean("Dr. Some Name"): "ACP",
+    # "Dr. Some Name": "ACP",
 }
 DUTY_STRUCTURE = {"P": 3, "ACP": 6, "SAP": 6, "AP3": 9, "AP2": 9, "TA": 11, "RA": 11}
 
@@ -438,6 +438,9 @@ def pw_ensure_all(id_list: list):
 # ═══════════════════════════════════════════════════════════════ #
 def clean(x):
     return str(x).strip().lower()
+
+# Build clean-keyed lookup after clean() is available
+FACULTY_DESIG_OVERRIDE = {clean(k): v for k, v in FACULTY_DESIG_OVERRIDE_RAW.items()}
 
 # ── TA/RA duty-count group (4 or 5 duties, may select Saturday dates) ── #
 _SAT_PREASSIGN_RAW = [
