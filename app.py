@@ -644,7 +644,7 @@ def build_msg(name, will, val, inv, qp, match_str="", dev_lines=None):
         *(val or ["  Not available"]),
         "",
         "3) QP Feedback Dates:",
-        *(qp or ["  Not available"]),
+        *(qp or ["  Please check the faculty webmaster portal"]),
         "",
     ]
     if match_str:
