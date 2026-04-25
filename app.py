@@ -260,11 +260,35 @@ def db_get_all_allocation():
     return r.data or []
 
 def db_get_setting(key: str, default: str = "") -> str:
-    r = _sb().table("portal_settings").select("value").eq("key", key).execute()
-    return r.data[0]["value"] if r.data else default
+    # Try session state cache first (avoids a DB round-trip and works even if table missing)
+    _ss_key = f"_setting_{key}"
+    if _ss_key in st.session_state:
+        return st.session_state[_ss_key]
+    try:
+        r = _sb().table("portal_settings").select("value").eq("key", key).execute()
+        val = r.data[0]["value"] if r.data else default
+        st.session_state[_ss_key] = val
+        return val
+    except Exception:
+        return default
 
 def db_set_setting(key: str, value: str):
-    _sb().table("portal_settings").upsert({"key": key, "value": value}).execute()
+    # Always update session-state cache so the UI reflects the change immediately
+    st.session_state[f"_setting_{key}"] = value
+    try:
+        # Try upsert with explicit conflict column first (requires 'key' to be PK/unique)
+        _sb().table("portal_settings").upsert(
+            {"key": key, "value": value},
+            on_conflict="key"
+        ).execute()
+    except Exception:
+        try:
+            # Fallback: delete then insert
+            _sb().table("portal_settings").delete().eq("key", key).execute()
+            _sb().table("portal_settings").insert({"key": key, "value": value}).execute()
+        except Exception:
+            # Table may not exist — setting is preserved in session state only
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════ #
