@@ -199,6 +199,19 @@ FACULTY_VALUATION_OVERRIDE_RAW: dict = {
     "M. Tagore":        {"2026-06-16"},
     "S. Paul Joshua":   {"2026-06-16"},
 }
+# ── Forced date assignments (specific faculty MUST get these slots) ─────────
+# Key = name substring as stored in Supabase (without honorifics)
+# Value = list of (YYYY-MM-DD, session) tuples
+FORCED_ASSIGNMENTS_RAW: dict = {
+    "Mohammed Mustafa": [("2026-06-10", "FN"), ("2026-06-11", "FN")],
+    "Jeyaraj":          [("2026-06-10", "AN"), ("2026-06-11", "AN")],
+}
+
+# Antony (Shri S. Antony) gets 2 Saturday duties; total duties = 4
+# All other SAT_PREASSIGN faculty get 1 Saturday each (19 faculty)
+# Antony's 2nd Saturday makes total Saturday coverage = 20
+ANTONY_NORM_NAME = "s. antony"   # _norm_name("Shri S. Antony")
+
 # Supabase already has correct values. This overrides at app level as backup.
 # Key = exact name as stored in Supabase | Value = designation code
 FACULTY_DESIG_OVERRIDE_RAW: dict = {
@@ -467,6 +480,17 @@ def _norm_name(name: str) -> str:
 
 # Build clean-keyed lookup after clean() is available
 FACULTY_DESIG_OVERRIDE = {_norm_name(k): v for k, v in FACULTY_DESIG_OVERRIDE_RAW.items()}
+
+# Build forced assignments with _norm_name keys and parsed dates
+import datetime as _dt_mod
+FORCED_ASSIGNMENTS: dict = {
+    _norm_name(k): [
+        {"date": _dt_mod.date.fromisoformat(d), "session": s, "type": "Offline"}
+        for d, s in v
+    ]
+    for k, v in FORCED_ASSIGNMENTS_RAW.items()
+}
+del _dt_mod
 
 # Build valuation override with _norm_name keys
 FACULTY_VALUATION_OVERRIDE = {
@@ -1491,6 +1515,50 @@ def _greedy_solve(core, log):
         return (sc, -filled_ratio)
 
     assigned = []
+
+    # ── Forced assignments — specific faculty on specific dates ────────────────
+    _sat_slots_sorted = sorted(
+        [s for s in ALL_S if s["date"].weekday() == 5],
+        key=lambda s: (s["date"], s["session"]))
+
+    def _force_assign(fn, fslot):
+        """Add a forced assignment if slot exists and faculty not already on that date/sess."""
+        if (fslot["date"], fslot["session"]) in used_dt_sess[fn]:
+            return False
+        for _sl in ALL_S:
+            if _sl["date"] == fslot["date"] and _sl["session"] == fslot["session"]:
+                k  = (fslot["date"], fslot["session"], "Offline")
+                sc = fexp[fn].get(k, 0)
+                assigned.append({"Name": fn, "Date": fslot["date"],
+                                 "Session": fslot["session"], "Type": "Offline",
+                                 "Allocated_By": tag(fn, k, sc)})
+                alloc_count[fn] += 1
+                used_dt_sess[fn].add((fslot["date"], fslot["session"]))
+                return True
+        return False  # slot not in exam schedule
+
+    # Apply FORCED_ASSIGNMENTS (Mustafa → 10+11 Jun, Jeyaraj → 10+11 Jun)
+    for _fn in ALL_FAC:
+        _fnc = _norm_name(_fn)
+        if _fnc in FORCED_ASSIGNMENTS:
+            for _fslot in FORCED_ASSIGNMENTS[_fnc]:
+                if is_eligible(_fn, _fslot):
+                    _force_assign(_fn, _fslot)
+
+    # Antony gets 2 Saturday duties (covers the 20th Saturday slot)
+    _antony_fn = next((fn for fn in ALL_FAC if _norm_name(fn) == ANTONY_NORM_NAME), None)
+    if _antony_fn:
+        _antony_sat_count = 0
+        for _sat_sl in _sat_slots_sorted:
+            if _antony_sat_count >= 2:
+                break
+            if not is_eligible(_antony_fn, _sat_sl):
+                continue
+            if (_sat_sl["date"], _sat_sl["session"]) in used_dt_sess[_antony_fn]:
+                continue
+            if _force_assign(_antony_fn, _sat_sl):
+                _antony_sat_count += 1
+
     for sl in sorted(ALL_S, key=lambda s: -s["required"]):
         needed = sl["required"]
         cands  = sorted([fn for fn in ALL_FAC_SHUFFLED if eligible(fn, sl)],
@@ -1618,6 +1686,26 @@ def _cpsat_solve(core, log):
             fi = FAC_IDX[fn]
             if off_i: mdl.Add(sum(x[(fi, si)] for si in off_i) <= 2)
 
+        # Forced assignments (named date/session pairs)
+        for _fn in ALL_FAC:
+            _fnc = _norm_name(_fn)
+            _fi  = FAC_IDX.get(_fn)
+            if _fi is None: continue
+
+            if _fnc in FORCED_ASSIGNMENTS:
+                for _fslot in FORCED_ASSIGNMENTS[_fnc]:
+                    _si = next((i for i, s in enumerate(ALL_S)
+                                if s["date"] == _fslot["date"] and s["session"] == _fslot["session"]), None)
+                    if _si is not None and is_eligible(_fn, ALL_S[_si]):
+                        mdl.Add(x[(_fi, _si)] == 1)
+
+            # Antony: force 2 Saturday slots
+            if _fnc == ANTONY_NORM_NAME:
+                _sat_sis = [i for i, s in enumerate(ALL_S)
+                            if s["date"].weekday() == 5 and is_eligible(_fn, s)]
+                for _si in _sat_sis[:2]:
+                    mdl.Add(x[(_fi, _si)] == 1)
+
 
 
         solver = cp_model.CpSolver()
@@ -1739,6 +1827,29 @@ def _milp_solve(core, log):
         fi = FAC_IDX[fn]
         if off_i:
             add_con([v(fi,si) for si in off_i], [1]*len(off_i), 0, 2)
+
+    # Forced assignments — set lower bound = 1 for forced (faculty, slot) pairs
+    for _fn in ALL_FAC:
+        _fnc = _norm_name(_fn)
+        _fi  = FAC_IDX.get(_fn)
+        if _fi is None: continue
+
+        # Named forced date assignments
+        if _fnc in FORCED_ASSIGNMENTS:
+            for _fslot in FORCED_ASSIGNMENTS[_fnc]:
+                _si = next((i for i, s in enumerate(ALL_S)
+                            if s["date"] == _fslot["date"] and s["session"] == _fslot["session"]), None)
+                if _si is not None and is_eligible(_fn, ALL_S[_si]):
+                    lb[v(_fi, _si)] = 1.0
+
+        # Antony: force 2 Saturday slots
+        if _fnc == ANTONY_NORM_NAME:
+            _sat_count = 0
+            for _si, _sl in enumerate(ALL_S):
+                if _sat_count >= 2: break
+                if _sl["date"].weekday() == 5 and is_eligible(_fn, _sl):
+                    lb[v(_fi, _si)] = 1.0
+                    _sat_count += 1
 
     from scipy.sparse import csc_matrix
     A = csc_matrix((dA, (rA, cA)), shape=(nc[0], NV))
