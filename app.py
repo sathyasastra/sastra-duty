@@ -209,7 +209,7 @@ FACULTY_DATE_CAP_RAW: dict = {
 # Key = name substring as stored in Supabase (without honorifics)
 # Value = list of (YYYY-MM-DD, session) tuples
 FORCED_ASSIGNMENTS_RAW: dict = {
-    "Mohammed Mustafa": [("2026-06-10", "FN"), ("2026-06-11", "FN")],
+    "Mohammed Mustafa": [("2026-06-11", "FN"), ("2026-06-11", "AN")],   # both sessions on 11-Jun
     "Jeyaraj":          [("2026-06-10", "AN"), ("2026-06-11", "AN")],
 }
 
