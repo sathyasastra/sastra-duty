@@ -199,6 +199,12 @@ FACULTY_VALUATION_OVERRIDE_RAW: dict = {
     "M. Tagore":        {"2026-06-16"},
     "S. Paul Joshua":   {"2026-06-16"},
 }
+# ── Per-faculty date cap — duties must be assigned BEFORE this date ──────────
+# Key = name substring (without honorifics) | Value = "YYYY-MM-DD" (exclusive upper bound)
+FACULTY_DATE_CAP_RAW: dict = {
+    "S. Balamurli": "2026-05-15",   # all 4 duties must fall before 15-May-2026
+}
+
 # ── Forced date assignments (specific faculty MUST get these slots) ─────────
 # Key = name substring as stored in Supabase (without honorifics)
 # Value = list of (YYYY-MM-DD, session) tuples
@@ -480,6 +486,12 @@ def _norm_name(name: str) -> str:
 
 # Build clean-keyed lookup after clean() is available
 FACULTY_DESIG_OVERRIDE = {_norm_name(k): v for k, v in FACULTY_DESIG_OVERRIDE_RAW.items()}
+
+# Build date cap lookup
+FACULTY_DATE_CAP: dict = {
+    _norm_name(k): datetime.date.fromisoformat(v)
+    for k, v in FACULTY_DATE_CAP_RAW.items()
+}
 
 # Build forced assignments with _norm_name keys and parsed dates
 import datetime as _dt_mod
@@ -1384,6 +1396,9 @@ def _load_core(log):
         if sl["date"] in fac_val.get(fn, set()):                            return False
         # Per-faculty blackout dates (exam on that day etc.)
         if _norm_name(fn) in FACULTY_BLACKOUT_CLEAN and sl["date"] in FACULTY_BLACKOUT_CLEAN[_norm_name(fn)]:
+            return False
+        # Per-faculty date cap (duties must be before specified date)
+        if _norm_name(fn) in FACULTY_DATE_CAP and sl["date"] >= FACULTY_DATE_CAP[_norm_name(fn)]:
             return False
         if sl["date"].weekday() == 5 and d2 not in SAT_DESIG:              return False
         return True
