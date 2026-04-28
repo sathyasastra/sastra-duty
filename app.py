@@ -202,7 +202,16 @@ FACULTY_VALUATION_OVERRIDE_RAW: dict = {
 # ── Per-faculty date cap — duties must be assigned BEFORE this date ──────────
 # Key = name substring (without honorifics) | Value = "YYYY-MM-DD" (exclusive upper bound)
 FACULTY_DATE_CAP_RAW: dict = {
-    "S. Balamurli": "2026-05-15",   # all 4 duties must fall before 15-May-2026
+    "S. Balamurli": "2026-05-15",   # all duties must fall before 15-May-2026
+}
+
+# ── Per-faculty duty count overrides ─────────────────────────────────────────
+# Balamurli excluded (0 duties); his 4 duties redistributed:
+# 2 to Sudhakar S, 2 to N. Arun Kumar (each gets 4 regular + 2 extra = 6)
+FACULTY_DUTY_OVERRIDE_RAW: dict = {
+    "S. Balamurli":  0,   # excluded from allotment — redistributed below
+    "Sudhakar S":    6,   # 4 regular + 2 from Balamurli
+    "N. Arun Kumar": 6,   # 4 regular + 2 from Balamurli
 }
 
 # ── Forced date assignments (specific faculty MUST get these slots) ─────────
@@ -493,6 +502,11 @@ FACULTY_DATE_CAP: dict = {
     for k, v in FACULTY_DATE_CAP_RAW.items()
 }
 
+# Build duty override lookup
+FACULTY_DUTY_OVERRIDE: dict = {
+    _norm_name(k): v for k, v in FACULTY_DUTY_OVERRIDE_RAW.items()
+}
+
 # Build forced assignments with _norm_name keys and parsed dates
 import datetime as _dt_mod
 FORCED_ASSIGNMENTS: dict = {
@@ -576,6 +590,10 @@ def fac_duty_range(fn: str, desig: str) -> tuple:
     """Return (min_duties, max_duties) for a faculty member.
     Strips honorifics before matching so Supabase names match correctly."""
     fc = _norm_name(fn)
+    # Per-faculty override takes highest priority (0 = excluded, N = extra duties)
+    if fc in FACULTY_DUTY_OVERRIDE:
+        n = FACULTY_DUTY_OVERRIDE[fc]
+        return n, n
     if fc in FIVE_DUTY_CLEAN:
         return 5, 5
     if fc in SAT_PREASSIGN_CLEAN:
